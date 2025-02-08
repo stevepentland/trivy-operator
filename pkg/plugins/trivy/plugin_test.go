@@ -2,10 +2,8 @@ package trivy_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -15,14 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aquasecurity/trivy-operator/pkg/docker"
-
-	dbtypes "github.com/aquasecurity/trivy-db/pkg/types"
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/ext"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	bz "github.com/dsnet/compress/bzip2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,800 +22,24 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	dbtypes "github.com/aquasecurity/trivy-db/pkg/types"
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/docker"
+	"github.com/aquasecurity/trivy-operator/pkg/ext"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
+	"github.com/aquasecurity/trivy-operator/pkg/vulnerabilityreport"
 )
 
 var (
 	fixedTime  = time.Now()
 	fixedClock = ext.NewFixedClock(fixedTime)
 )
-
-func TestConfig_GetImageRef(t *testing.T) {
-	testCases := []struct {
-		name             string
-		configData       trivy.Config
-		expectedError    string
-		expectedImageRef string
-	}{
-		{
-			name:          "Should return error",
-			configData:    trivy.Config{PluginConfig: trivyoperator.PluginConfig{}},
-			expectedError: "property trivy.repository not set",
-		},
-		{
-			name: "Should return error",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.tag": "0.8.0",
-				},
-			}},
-			expectedError: "property trivy.repository not set",
-		},
-		{
-			name: "Should return error",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.repository": "gcr.io/aquasecurity/trivy",
-				},
-			}},
-			expectedError: "property trivy.tag not set",
-		},
-		{
-			name: "Should return image reference from config data",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.repository": "gcr.io/aquasecurity/trivy",
-					"trivy.tag":        "0.8.0",
-				},
-			}},
-			expectedImageRef: "gcr.io/aquasecurity/trivy:0.8.0",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			imageRef, err := tc.configData.GetImageRef()
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expectedImageRef, imageRef)
-			}
-		})
-	}
-}
-
-func TestConfig_GetAdditionalVulnerabilityReportFields(t *testing.T) {
-	testCases := []struct {
-		name             string
-		configData       trivy.Config
-		additionalFields trivy.AdditionalFields
-	}{
-		{
-			name:             "no additional fields are set",
-			configData:       trivy.Config{PluginConfig: trivyoperator.PluginConfig{}},
-			additionalFields: trivy.AdditionalFields{},
-		},
-		{
-			name: "all additional fields are set",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.additionalVulnerabilityReportFields": "PackageType,Class,Target,Links,Description,CVSS",
-				},
-			}},
-			additionalFields: trivy.AdditionalFields{Description: true, Links: true, CVSS: true, Class: true, PackageType: true, Target: true},
-		},
-		{
-			name: "some additional fields are set",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.additionalVulnerabilityReportFields": "PackageType,Target,Links,CVSS",
-				},
-			}},
-			additionalFields: trivy.AdditionalFields{Links: true, CVSS: true, PackageType: true, Target: true},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			addFields := tc.configData.GetAdditionalVulnerabilityReportFields()
-			assert.True(t, addFields.Description == tc.additionalFields.Description)
-			assert.True(t, addFields.CVSS == tc.additionalFields.CVSS)
-			assert.True(t, addFields.Target == tc.additionalFields.Target)
-			assert.True(t, addFields.PackageType == tc.additionalFields.PackageType)
-			assert.True(t, addFields.Class == tc.additionalFields.Class)
-			assert.True(t, addFields.Links == tc.additionalFields.Links)
-		})
-	}
-}
-
-func TestConfig_GetMode(t *testing.T) {
-	testCases := []struct {
-		name          string
-		configData    trivy.Config
-		expectedError string
-		expectedMode  trivy.Mode
-	}{
-		{
-			name: "Should return Standalone",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.mode": string(trivy.Standalone),
-				},
-			}},
-			expectedMode: trivy.Standalone,
-		},
-		{
-			name: "Should return ClientServer",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.mode": string(trivy.ClientServer),
-				},
-			}},
-			expectedMode: trivy.ClientServer,
-		},
-		{
-			name:          "Should return error when value is not set",
-			configData:    trivy.Config{PluginConfig: trivyoperator.PluginConfig{}},
-			expectedError: "property trivy.mode not set",
-		},
-		{
-			name: "Should return error when value is not allowed",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.mode": "P2P",
-				},
-			}},
-			expectedError: "invalid value (P2P) of trivy.mode; allowed values (Standalone, ClientServer)",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			mode, err := tc.configData.GetMode()
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expectedMode, mode)
-			}
-		})
-	}
-}
-
-func TestGetSlow(t *testing.T) {
-	testCases := []struct {
-		name       string
-		configData trivy.Config
-		want       bool
-	}{
-		{
-			name: "slow param set to true",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.slow": "true",
-				},
-			}},
-			want: true,
-		},
-		{
-			name: "slow param set to false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.slow": "false",
-				},
-			}},
-			want: false,
-		},
-		{
-			name: "slow param set to no valid value",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.slow": "false2",
-				},
-			}},
-			want: true,
-		},
-		{
-			name: "slow param set to no  value",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{},
-			}},
-			want: true,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := tc.configData.GetSlow()
-			assert.Equal(t, got, tc.want)
-
-		})
-	}
-}
-func TestConfig_GetCommand(t *testing.T) {
-	testCases := []struct {
-		name            string
-		configData      trivy.Config
-		expectedError   string
-		expectedCommand trivy.Command
-	}{
-		{
-			name: "Should return image",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.command": "image",
-				},
-			}},
-			expectedCommand: trivy.Image,
-		},
-		{
-			name: "Should return image when value is not set",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{},
-			}},
-			expectedCommand: trivy.Image,
-		},
-		{
-			name: "Should return filesystem",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.command": "filesystem",
-				},
-			}},
-			expectedCommand: trivy.Filesystem,
-		},
-		{
-			name: "Should return rootfs",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.command": "rootfs",
-				},
-			}},
-			expectedCommand: trivy.Rootfs,
-		},
-		{
-			name: "Should return error when value is not allowed",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.command": "ls",
-				},
-			}},
-			expectedError: "invalid value (ls) of trivy.command; allowed values (image, filesystem, rootfs)",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			command, err := tc.configData.GetCommand()
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expectedCommand, command)
-			}
-		})
-	}
-}
-
-func TestVulnType(t *testing.T) {
-	testCases := []struct {
-		name       string
-		configData trivy.Config
-		want       string
-	}{
-		{
-			name: "valid vuln type os",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.vulnType": "os",
-				},
-			}},
-			want: "os",
-		},
-		{
-			name: "valid vuln type library",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.vulnType": "library",
-				},
-			}},
-			want: "library",
-		},
-		{
-			name: "empty vuln type",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.vulnType": "",
-				},
-			}},
-			want: "",
-		},
-		{
-			name: "non valid vuln type",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.vulnType": "aaa",
-				},
-			}},
-			want: "",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := tc.configData.GetVulnType()
-			assert.Equal(t, got, tc.want)
-
-		})
-	}
-}
-
-func TestConfig_GetResourceRequirements(t *testing.T) {
-	testCases := []struct {
-		name                 string
-		config               trivy.Config
-		expectedError        string
-		expectedRequirements corev1.ResourceRequirements
-	}{
-		{
-			name: "Should return empty requirements by default",
-			config: trivy.Config{
-				PluginConfig: trivyoperator.PluginConfig{},
-			},
-			expectedError: "",
-			expectedRequirements: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{},
-				Limits:   corev1.ResourceList{},
-			},
-		},
-		{
-			name: "Should return configured resource requirement",
-			config: trivy.Config{
-				PluginConfig: trivyoperator.PluginConfig{
-					Data: map[string]string{
-						"trivy.dbRepository":              trivy.DefaultDBRepository,
-						"trivy.javaDbRepository":          trivy.DefaultJavaDBRepository,
-						"trivy.resources.requests.cpu":    "800m",
-						"trivy.resources.requests.memory": "200M",
-						"trivy.resources.limits.cpu":      "600m",
-						"trivy.resources.limits.memory":   "700M",
-					},
-				},
-			},
-			expectedError: "",
-			expectedRequirements: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("800m"),
-					corev1.ResourceMemory: resource.MustParse("200M"),
-				},
-				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("600m"),
-					corev1.ResourceMemory: resource.MustParse("700M"),
-				},
-			},
-		},
-		{
-			name: "Should return error if resource is not parseable",
-			config: trivy.Config{
-				PluginConfig: trivyoperator.PluginConfig{
-					Data: map[string]string{
-						"trivy.resources.requests.cpu": "roughly 100",
-					},
-				},
-			},
-			expectedError: "parsing resource definition trivy.resources.requests.cpu: roughly 100 quantities must match the regular expression '^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$'",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			resourceRequirement, err := tc.config.GetResourceRequirements()
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expectedRequirements, resourceRequirement, tc.name)
-			}
-		})
-	}
-}
-
-func TestConfig_IgnoreFileExists(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput bool
-	}{
-		{
-			name: "Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: false,
-		},
-		{
-			name: "Should return true",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-					"trivy.ignoreFile": `# Accept the risk
-CVE-2018-14618
-
-# No impact in our settings
-CVE-2019-1543`,
-				},
-			}},
-			expectedOutput: true,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			exists := tc.configData.IgnoreFileExists()
-			assert.Equal(t, tc.expectedOutput, exists)
-		})
-	}
-}
-
-func TestConfig_IgnoreUnfixed(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput bool
-	}{
-		{
-			name: "Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: false,
-		},
-		{
-			name: "Should return true",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":                 "bar",
-					"trivy.ignoreUnfixed": "true",
-				},
-			}},
-			expectedOutput: true,
-		},
-		{
-			name: "Should return false when set it as false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":                 "bar",
-					"trivy.ignoreUnfixed": "false",
-				},
-			}},
-			expectedOutput: true,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			exists := tc.configData.IgnoreUnfixed()
-			assert.Equal(t, tc.expectedOutput, exists)
-		})
-	}
-}
-
-func TestConfig_OfflineScan(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput bool
-	}{
-		{
-			name: "Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: false,
-		},
-		{
-			name: "Should return true",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":               "bar",
-					"trivy.offlineScan": "true",
-				},
-			}},
-			expectedOutput: true,
-		},
-		{
-			name: "Should return false when set it as false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":               "bar",
-					"trivy.offlineScan": "false",
-				},
-			}},
-			expectedOutput: true,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			exists := tc.configData.OfflineScan()
-			assert.Equal(t, tc.expectedOutput, exists)
-		})
-	}
-}
-
-func TestConfig_dbRepositoryInsecure(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput bool
-	}{
-		{
-			name: "good value Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.dbRepositoryInsecure": "false",
-				},
-			}},
-			expectedOutput: false,
-		},
-		{
-			name: "good value Should return true",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.dbRepositoryInsecure": "true",
-				},
-			}},
-			expectedOutput: true,
-		},
-		{
-			name: "bad value Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.dbRepositoryInsecure": "true1",
-				},
-			}},
-			expectedOutput: false,
-		},
-		{
-			name: "no value Should return false",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{},
-			}},
-			expectedOutput: false,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			exists := tc.configData.GetDBRepositoryInsecure()
-			assert.Equal(t, tc.expectedOutput, exists)
-		})
-	}
-}
-
-func TestConfig_GetInsecureRegistries(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput map[string]bool
-	}{
-		{
-			name: "Should return nil map when there is no key with trivy.insecureRegistry. prefix",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: make(map[string]bool),
-		},
-		{
-			name: "Should return insecure registries in map",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":                                "bar",
-					"trivy.insecureRegistry.pocRegistry": "poc.myregistry.harbor.com.pl",
-					"trivy.insecureRegistry.qaRegistry":  "qa.registry.aquasec.com",
-				},
-			}},
-			expectedOutput: map[string]bool{
-				"poc.myregistry.harbor.com.pl": true,
-				"qa.registry.aquasec.com":      true,
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			insecureRegistries := tc.configData.GetInsecureRegistries()
-			assert.Equal(t, tc.expectedOutput, insecureRegistries)
-		})
-	}
-}
-
-func TestConfig_GetNonSSLRegistries(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput map[string]bool
-	}{
-		{
-			name: "Should return nil map when there is no key with trivy.nonSslRegistry. prefix",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: make(map[string]bool),
-		},
-		{
-			name: "Should return insecure registries in map",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo":                              "bar",
-					"trivy.nonSslRegistry.pocRegistry": "poc.myregistry.harbor.com.pl",
-					"trivy.nonSslRegistry.qaRegistry":  "qa.registry.aquasec.com",
-				},
-			}},
-			expectedOutput: map[string]bool{
-				"poc.myregistry.harbor.com.pl": true,
-				"qa.registry.aquasec.com":      true,
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			nonSslRegistries := tc.configData.GetNonSSLRegistries()
-			assert.Equal(t, tc.expectedOutput, nonSslRegistries)
-		})
-	}
-}
-
-func TestConfig_GetMirrors(t *testing.T) {
-	testCases := []struct {
-		name           string
-		configData     trivy.Config
-		expectedOutput map[string]string
-	}{
-		{
-			name: "Should return empty map when there is no key with trivy.mirrors.registry. prefix",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"foo": "bar",
-				},
-			}},
-			expectedOutput: make(map[string]string),
-		},
-		{
-			name: "Should return mirrors in a map",
-			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
-				Data: map[string]string{
-					"trivy.registry.mirror.docker.io": "mirror.io",
-				},
-			}},
-			expectedOutput: map[string]string{"docker.io": "mirror.io"},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expectedOutput, tc.configData.GetMirrors())
-		})
-	}
-}
-
-func TestPlugin_Init(t *testing.T) {
-
-	t.Run("Should create the default config", func(t *testing.T) {
-		testClient := fake.NewClientBuilder().WithObjects().Build()
-		or := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
-		instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &or)
-
-		pluginContext := trivyoperator.NewPluginContext().
-			WithName(trivy.Plugin).
-			WithNamespace("trivyoperator-ns").
-			WithServiceAccountName("trivyoperator-sa").
-			WithClient(testClient).
-			Get()
-		err := instance.Init(pluginContext)
-		require.NoError(t, err)
-
-		var cm corev1.ConfigMap
-		err = testClient.Get(context.Background(), types.NamespacedName{
-			Namespace: "trivyoperator-ns",
-			Name:      "trivy-operator-trivy-config",
-		}, &cm)
-		require.NoError(t, err)
-		assert.Equal(t, corev1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "v1",
-				Kind:       "ConfigMap",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "trivy-operator-trivy-config",
-				Namespace: "trivyoperator-ns",
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "trivyoperator",
-				},
-				ResourceVersion: "1",
-			},
-			Data: map[string]string{
-				"trivy.repository":                trivy.DefaultImageRepository,
-				"trivy.tag":                       "0.41.0",
-				"trivy.severity":                  trivy.DefaultSeverity,
-				"trivy.slow":                      "true",
-				"trivy.mode":                      string(trivy.Standalone),
-				"trivy.timeout":                   "5m0s",
-				"trivy.dbRepository":              trivy.DefaultDBRepository,
-				"trivy.javaDbRepository":          trivy.DefaultJavaDBRepository,
-				"trivy.useBuiltinRegoPolicies":    "true",
-				"trivy.supportedConfigAuditKinds": trivy.SupportedConfigAuditKinds,
-				"trivy.resources.requests.cpu":    "100m",
-				"trivy.resources.requests.memory": "100M",
-				"trivy.resources.limits.cpu":      "500m",
-				"trivy.resources.limits.memory":   "500M",
-			},
-		}, cm)
-	})
-
-	t.Run("Should not overwrite existing config", func(t *testing.T) {
-		testClient := fake.NewClientBuilder().WithObjects(
-			&corev1.ConfigMap{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: "v1",
-					Kind:       "ConfigMap",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "trivy-operator-trivy-config",
-					Namespace:       "trivyoperator-ns",
-					ResourceVersion: "1",
-				},
-				Data: map[string]string{
-					"trivy.repository": "gcr.io/aquasecurity/trivy",
-					"trivy.tag":        "0.35.0",
-					"trivy.severity":   trivy.DefaultSeverity,
-					"trivy.mode":       string(trivy.Standalone),
-				},
-			}).Build()
-		resolver := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
-		instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
-
-		pluginContext := trivyoperator.NewPluginContext().
-			WithName(trivy.Plugin).
-			WithNamespace("trivyoperator-ns").
-			WithServiceAccountName("trivyoperator-sa").
-			WithClient(testClient).
-			Get()
-		err := instance.Init(pluginContext)
-		require.NoError(t, err)
-
-		var cm corev1.ConfigMap
-		err = testClient.Get(context.Background(), types.NamespacedName{
-			Namespace: "trivyoperator-ns",
-			Name:      "trivy-operator-trivy-config",
-		}, &cm)
-		require.NoError(t, err)
-		assert.Equal(t, corev1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "v1",
-				Kind:       "ConfigMap",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            "trivy-operator-trivy-config",
-				Namespace:       "trivyoperator-ns",
-				ResourceVersion: "1",
-			},
-			Data: map[string]string{
-				"trivy.repository": "gcr.io/aquasecurity/trivy",
-				"trivy.tag":        "0.35.0",
-				"trivy.severity":   trivy.DefaultSeverity,
-				"trivy.mode":       string(trivy.Standalone),
-			},
-		}, cm)
-	})
-}
 
 func TestPlugin_GetScanJobSpec(t *testing.T) {
 
@@ -852,7 +66,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 					Name: "trivy-operator-trivy-config",
 				},
 				Key:      "trivy.timeout",
-				Optional: pointer.Bool(true),
+				Optional: ptr.To[bool](true),
 			},
 		},
 	}
@@ -913,7 +127,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -932,7 +146,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -944,7 +158,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -956,7 +170,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -969,7 +183,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -997,12 +211,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1021,7 +235,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1033,7 +247,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1045,7 +259,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1057,7 +271,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1070,7 +284,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1082,7 +296,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1094,7 +308,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1106,7 +320,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1118,7 +332,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1128,7 +342,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -1144,12 +358,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1197,7 +411,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 				Affinity:                     trivyoperator.LinuxNodeAffinity(),
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
@@ -1217,7 +431,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1229,7 +443,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1241,7 +455,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1253,7 +467,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1281,12 +495,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1305,7 +519,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1317,7 +531,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1329,7 +543,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1341,7 +555,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1354,7 +568,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1366,7 +580,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1378,7 +592,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1390,7 +604,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1402,7 +616,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1416,7 +630,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -1432,12 +646,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1486,7 +700,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -1505,7 +719,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1517,7 +731,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1529,7 +743,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1541,7 +755,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1569,12 +783,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1593,7 +807,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1605,7 +819,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1617,7 +831,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1629,7 +843,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1642,7 +856,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1654,7 +868,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1666,7 +880,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1678,7 +892,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1690,7 +904,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1704,7 +918,7 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -1720,12 +934,12 @@ func TestPlugin_GetScanJobSpec(t *testing.T) {
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1778,7 +992,7 @@ CVE-2019-1543`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 					{
@@ -1813,7 +1027,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1825,7 +1039,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1837,7 +1051,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1849,7 +1063,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1877,12 +1091,12 @@ CVE-2019-1543`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -1901,7 +1115,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1913,7 +1127,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1925,7 +1139,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1937,7 +1151,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1950,7 +1164,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1962,7 +1176,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1974,7 +1188,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1986,7 +1200,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -1998,7 +1212,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2012,7 +1226,7 @@ CVE-2019-1543`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -2033,12 +1247,12 @@ CVE-2019-1543`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2091,7 +1305,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 					{
@@ -2126,7 +1340,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2138,7 +1352,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2150,7 +1364,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2162,7 +1376,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2190,12 +1404,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2214,7 +1428,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2226,7 +1440,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2238,7 +1452,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2250,7 +1464,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2263,7 +1477,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2275,7 +1489,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2287,7 +1501,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2299,7 +1513,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2311,7 +1525,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2325,7 +1539,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -2346,12 +1560,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2402,7 +1616,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -2421,7 +1635,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2433,7 +1647,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2445,7 +1659,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2458,7 +1672,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2486,12 +1700,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2510,7 +1724,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2522,7 +1736,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2534,7 +1748,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2546,7 +1760,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2559,7 +1773,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2571,7 +1785,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2583,7 +1797,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2595,7 +1809,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2607,7 +1821,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2617,7 +1831,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'mirror.io/library/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'mirror.io/library/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -2633,12 +1847,12 @@ default ignore = false`,
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2690,7 +1904,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -2709,7 +1923,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2721,7 +1935,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2733,7 +1947,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2746,7 +1960,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2774,12 +1988,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2798,7 +2012,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2810,7 +2024,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2822,7 +2036,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2834,7 +2048,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2847,7 +2061,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2859,7 +2073,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2871,7 +2085,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2883,7 +2097,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2895,7 +2109,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -2905,7 +2119,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -2921,12 +2135,12 @@ default ignore = false`,
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -2975,7 +2189,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{getTmpVolume(),
 					getScanResultVolume(),
 				},
@@ -2994,7 +2208,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3006,7 +2220,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3018,7 +2232,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3030,7 +2244,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3042,7 +2256,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3054,7 +2268,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3066,7 +2280,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3079,7 +2293,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3091,7 +2305,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3103,7 +2317,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3115,7 +2329,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3127,7 +2341,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3137,7 +2351,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -3151,12 +2365,12 @@ default ignore = false`,
 						},
 						VolumeMounts: []corev1.VolumeMount{getTmpVolumeMount(), getScanResultVolumeMount()},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -3204,7 +2418,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
 				ServiceAccountName:           "trivyoperator-sa",
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{getTmpVolume(),
 					getScanResultVolume(),
 				},
@@ -3223,7 +2437,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3235,7 +2449,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3247,7 +2461,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3259,7 +2473,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3271,7 +2485,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3283,7 +2497,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3295,7 +2509,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3308,7 +2522,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3320,7 +2534,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3332,7 +2546,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3344,7 +2558,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3356,7 +2570,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3366,7 +2580,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -3380,12 +2594,12 @@ default ignore = false`,
 						},
 						VolumeMounts: []corev1.VolumeMount{getTmpVolumeMount(), getScanResultVolumeMount()},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -3434,7 +2648,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{getTmpVolume(),
 					getScanResultVolume(),
 				},
@@ -3453,7 +2667,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3465,7 +2679,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3477,7 +2691,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3489,7 +2703,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3501,7 +2715,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3513,7 +2727,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3525,7 +2739,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3538,7 +2752,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3550,7 +2764,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3562,7 +2776,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3574,7 +2788,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3586,7 +2800,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3600,7 +2814,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'https://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'https://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -3614,12 +2828,12 @@ default ignore = false`,
 						},
 						VolumeMounts: []corev1.VolumeMount{getTmpVolumeMount(), getScanResultVolumeMount()},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -3668,7 +2882,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{getTmpVolume(),
 					getScanResultVolume(),
 				},
@@ -3687,7 +2901,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3699,7 +2913,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3711,7 +2925,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3723,7 +2937,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3735,7 +2949,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3747,7 +2961,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3759,7 +2973,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3772,7 +2986,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3784,7 +2998,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3796,7 +3010,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3808,7 +3022,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3820,7 +3034,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3834,7 +3048,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'poc.myregistry.harbor.com.pl/nginx:1.16' --security-checks vuln     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -3848,12 +3062,12 @@ default ignore = false`,
 						},
 						VolumeMounts: []corev1.VolumeMount{getTmpVolumeMount(), getScanResultVolumeMount()},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -3906,7 +3120,7 @@ CVE-2019-1543`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 
 				Volumes: []corev1.Volume{getTmpVolume(), getScanResultVolume(),
 					{
@@ -3941,7 +3155,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3953,7 +3167,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3965,7 +3179,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3977,7 +3191,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -3989,7 +3203,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4001,7 +3215,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4013,7 +3227,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4026,7 +3240,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4038,7 +3252,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4050,7 +3264,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4062,7 +3276,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4074,7 +3288,7 @@ CVE-2019-1543`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4088,7 +3302,7 @@ CVE-2019-1543`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -4108,12 +3322,12 @@ CVE-2019-1543`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -4166,7 +3380,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 
 				Volumes: []corev1.Volume{getTmpVolume(), getScanResultVolume(),
 					{
@@ -4201,7 +3415,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4213,7 +3427,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4225,7 +3439,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4237,7 +3451,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4249,7 +3463,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4261,7 +3475,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4273,7 +3487,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4286,7 +3500,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4298,7 +3512,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4310,7 +3524,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4322,7 +3536,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4334,7 +3548,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4348,7 +3562,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -4368,12 +3582,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -4421,7 +3635,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{getTmpVolume(),
 					getScanResultVolume(),
 				},
@@ -4440,7 +3654,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4452,7 +3666,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4464,7 +3678,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4476,7 +3690,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4488,7 +3702,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4500,7 +3714,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4512,7 +3726,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4525,7 +3739,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4537,7 +3751,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4549,7 +3763,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4561,7 +3775,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4573,7 +3787,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4583,7 +3797,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret     --cache-dir /tmp/trivy/.cache --quiet  --format json --server 'http://trivy.trivy:4954' > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -4597,12 +3811,12 @@ default ignore = false`,
 						},
 						VolumeMounts: []corev1.VolumeMount{getTmpVolumeMount(), getScanResultVolumeMount()},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -4626,6 +3840,7 @@ default ignore = false`,
 				"trivy.resources.requests.memory": "100M",
 				"trivy.resources.limits.cpu":      "500m",
 				"trivy.resources.limits.memory":   "500M",
+				"trivy.timeout":                   "5m0s",
 			},
 			workloadSpec: &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -4650,7 +3865,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					{
 						Name: trivy.FsSharedVolumeName,
@@ -4705,12 +3920,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 					{
@@ -4727,7 +3942,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4739,7 +3954,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4751,7 +3966,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4764,7 +3979,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4802,12 +4017,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -4826,7 +4041,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4838,7 +4053,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4850,7 +4065,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4862,7 +4077,19 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
+									},
+								},
+							},
+							{
+								Name: "TRIVY_TIMEOUT",
+								ValueFrom: &corev1.EnvVarSource{
+									ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "trivy-operator-trivy-config",
+										},
+										Key:      "trivy.timeout",
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4874,7 +4101,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4886,7 +4113,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4898,7 +4125,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -4943,12 +4170,12 @@ default ignore = false`,
 							getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -4975,6 +4202,7 @@ default ignore = false`,
 				"trivy.resources.requests.memory": "100M",
 				"trivy.resources.limits.cpu":      "500m",
 				"trivy.resources.limits.memory":   "500M",
+				"trivy.timeout":                   "5m0s",
 			},
 			workloadSpec: &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -4999,7 +4227,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					{
 						Name: trivy.FsSharedVolumeName,
@@ -5054,12 +4282,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5078,7 +4306,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5090,7 +4318,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5102,7 +4330,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5114,7 +4342,19 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
+									},
+								},
+							},
+							{
+								Name: "TRIVY_TIMEOUT",
+								ValueFrom: &corev1.EnvVarSource{
+									ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "trivy-operator-trivy-config",
+										},
+										Key:      "trivy.timeout",
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5126,7 +4366,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5138,7 +4378,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5150,7 +4390,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5162,7 +4402,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5174,7 +4414,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5186,7 +4426,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5233,12 +4473,12 @@ default ignore = false`,
 							getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5264,6 +4504,7 @@ default ignore = false`,
 				"trivy.resources.requests.memory": "100M",
 				"trivy.resources.limits.cpu":      "500m",
 				"trivy.resources.limits.memory":   "500M",
+				"trivy.timeout":                   "5m0s",
 			},
 			workloadSpec: &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -5288,7 +4529,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					{
 						Name: trivy.FsSharedVolumeName,
@@ -5343,12 +4584,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 					{
@@ -5365,7 +4606,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5377,7 +4618,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5389,7 +4630,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5402,7 +4643,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5440,12 +4681,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5464,7 +4705,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5476,7 +4717,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5488,7 +4729,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5500,7 +4741,19 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
+									},
+								},
+							},
+							{
+								Name: "TRIVY_TIMEOUT",
+								ValueFrom: &corev1.EnvVarSource{
+									ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "trivy-operator-trivy-config",
+										},
+										Key:      "trivy.timeout",
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5512,7 +4765,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5524,7 +4777,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5536,7 +4789,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5581,12 +4834,12 @@ default ignore = false`,
 							getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5613,6 +4866,7 @@ default ignore = false`,
 				"trivy.resources.requests.memory": "100M",
 				"trivy.resources.limits.cpu":      "500m",
 				"trivy.resources.limits.memory":   "500M",
+				"trivy.timeout":                   "5m0s",
 			},
 			workloadSpec: &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -5637,7 +4891,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					{
 						Name: trivy.FsSharedVolumeName,
@@ -5692,12 +4946,12 @@ default ignore = false`,
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5716,7 +4970,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5728,7 +4982,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5740,7 +4994,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5752,7 +5006,19 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
+									},
+								},
+							},
+							{
+								Name: "TRIVY_TIMEOUT",
+								ValueFrom: &corev1.EnvVarSource{
+									ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "trivy-operator-trivy-config",
+										},
+										Key:      "trivy.timeout",
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5764,7 +5030,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5776,7 +5042,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5788,7 +5054,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverTokenHeader",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5800,7 +5066,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5812,7 +5078,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.serverCustomHeaders",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5824,7 +5090,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5871,12 +5137,12 @@ default ignore = false`,
 							getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -5928,7 +5194,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -5947,7 +5213,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5959,7 +5225,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5971,7 +5237,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -5984,7 +5250,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6012,12 +5278,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6036,7 +5302,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6048,7 +5314,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6060,7 +5326,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6072,7 +5338,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6085,7 +5351,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6097,7 +5363,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6109,7 +5375,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6121,7 +5387,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6133,7 +5399,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6147,7 +5413,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow '000000000000.dkr.ecr.eu-west-1.amazonaws.com/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow '000000000000.dkr.ecr.eu-west-1.amazonaws.com/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -6163,12 +5429,12 @@ default ignore = false`,
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6226,7 +5492,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -6245,7 +5511,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6257,7 +5523,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6269,7 +5535,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6281,7 +5547,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6309,12 +5575,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6333,7 +5599,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6345,7 +5611,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6357,7 +5623,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6369,7 +5635,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6382,7 +5648,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6394,7 +5660,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6406,7 +5672,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6418,7 +5684,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6430,7 +5696,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6462,7 +5728,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -6478,12 +5744,12 @@ default ignore = false`,
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6543,7 +5809,7 @@ default ignore = false`,
 				RestartPolicy:                corev1.RestartPolicyNever,
 				ServiceAccountName:           "trivyoperator-sa",
 				ImagePullSecrets:             []corev1.LocalObjectReference{},
-				AutomountServiceAccountToken: pointer.Bool(false),
+				AutomountServiceAccountToken: ptr.To[bool](false),
 				Volumes: []corev1.Volume{
 					tmpVolume, getScanResultVolume(),
 				},
@@ -6562,7 +5828,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6574,7 +5840,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6586,7 +5852,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6598,7 +5864,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.githubToken",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6626,12 +5892,12 @@ default ignore = false`,
 							tmpVolumeMount,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6650,7 +5916,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.severity",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6662,7 +5928,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.ignoreUnfixed",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6674,7 +5940,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.offlineScan",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6686,7 +5952,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.javaDbRepository",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6699,7 +5965,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipFiles",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6711,7 +5977,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.skipDirs",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6723,7 +5989,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6735,7 +6001,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.httpsProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6747,7 +6013,7 @@ default ignore = false`,
 											Name: "trivy-operator-trivy-config",
 										},
 										Key:      "trivy.noProxy",
-										Optional: pointer.Bool(true),
+										Optional: ptr.To[bool](true),
 									},
 								},
 							},
@@ -6779,7 +6045,7 @@ default ignore = false`,
 						},
 						Args: []string{
 							"-c",
-							"trivy image --slow 'mirror.io/library/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --cache-dir /tmp/trivy/.cache --quiet --skip-update --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
+							"trivy image --slow 'mirror.io/library/nginx:1.16' --security-checks vuln,secret --image-config-scanners secret   --skip-update  --cache-dir /tmp/trivy/.cache --quiet  --format json > /tmp/scan/result_nginx.json &&  bzip2 -c /tmp/scan/result_nginx.json | base64",
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -6795,12 +6061,12 @@ default ignore = false`,
 							tmpVolumeMount, getScanResultVolumeMount(),
 						},
 						SecurityContext: &corev1.SecurityContext{
-							Privileged:               pointer.Bool(false),
-							AllowPrivilegeEscalation: pointer.Bool(false),
+							Privileged:               ptr.To[bool](false),
+							AllowPrivilegeEscalation: ptr.To[bool](false),
 							Capabilities: &corev1.Capabilities{
 								Drop: []corev1.Capability{"all"},
 							},
-							ReadOnlyRootFilesystem: pointer.Bool(true),
+							ReadOnlyRootFilesystem: ptr.To[bool](true),
 						},
 					},
 				},
@@ -6829,14 +6095,14 @@ default ignore = false`,
 			resolver := kube.NewObjectResolver(fakeclient, &kube.CompatibleObjectMapper{})
 			instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
 			securityContext := &corev1.SecurityContext{
-				Privileged:               pointer.Bool(false),
-				AllowPrivilegeEscalation: pointer.Bool(false),
+				Privileged:               ptr.To[bool](false),
+				AllowPrivilegeEscalation: ptr.To[bool](false),
 				Capabilities: &corev1.Capabilities{
 					Drop: []corev1.Capability{"all"},
 				},
-				ReadOnlyRootFilesystem: pointer.Bool(true),
+				ReadOnlyRootFilesystem: ptr.To[bool](true),
 			}
-			jobSpec, secrets, err := instance.GetScanJobSpec(pluginContext, tc.workloadSpec, tc.credentials, securityContext)
+			jobSpec, secrets, err := instance.GetScanJobSpec(pluginContext, tc.workloadSpec, tc.credentials, securityContext, make(map[string]v1alpha1.SbomReportData))
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedJobSpec, jobSpec)
 			assert.Equal(t, len(tc.expectedSecretsData), len(secrets))
@@ -6873,6 +6139,7 @@ default ignore = false`,
 			"trivy.resources.requests.memory": "100M",
 			"trivy.resources.limits.cpu":      "500m",
 			"trivy.resources.limits.memory":   "500M",
+			"trivy.timeout":                   "5m0s",
 		},
 		workloadSpec: &corev1.Pod{
 			TypeMeta: metav1.TypeMeta{
@@ -6898,7 +6165,7 @@ default ignore = false`,
 			RestartPolicy:                corev1.RestartPolicyNever,
 			ServiceAccountName:           "trivyoperator-sa",
 			ImagePullSecrets:             []corev1.LocalObjectReference{},
-			AutomountServiceAccountToken: pointer.Bool(false),
+			AutomountServiceAccountToken: ptr.To[bool](false),
 			Volumes: []corev1.Volume{
 				{
 					Name: trivy.FsSharedVolumeName,
@@ -6953,13 +6220,13 @@ default ignore = false`,
 						},
 					},
 					SecurityContext: &corev1.SecurityContext{
-						Privileged:               pointer.Bool(false),
-						AllowPrivilegeEscalation: pointer.Bool(false),
+						Privileged:               ptr.To[bool](false),
+						AllowPrivilegeEscalation: ptr.To[bool](false),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"all"},
 						},
-						ReadOnlyRootFilesystem: pointer.Bool(true),
-						RunAsUser:              pointer.Int64(0),
+						ReadOnlyRootFilesystem: ptr.To[bool](true),
+						RunAsUser:              ptr.To[int64](0),
 					},
 				},
 				{
@@ -6976,7 +6243,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.httpProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -6988,7 +6255,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.httpsProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7000,7 +6267,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.noProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7012,7 +6279,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.githubToken",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7050,13 +6317,13 @@ default ignore = false`,
 						},
 					},
 					SecurityContext: &corev1.SecurityContext{
-						Privileged:               pointer.Bool(false),
-						AllowPrivilegeEscalation: pointer.Bool(false),
+						Privileged:               ptr.To[bool](false),
+						AllowPrivilegeEscalation: ptr.To[bool](false),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"all"},
 						},
-						ReadOnlyRootFilesystem: pointer.Bool(true),
-						RunAsUser:              pointer.Int64(0),
+						ReadOnlyRootFilesystem: ptr.To[bool](true),
+						RunAsUser:              ptr.To[int64](0),
 					},
 				},
 			},
@@ -7075,7 +6342,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.severity",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7087,7 +6354,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.skipFiles",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7099,7 +6366,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.skipDirs",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7111,7 +6378,19 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.httpProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
+								},
+							},
+						},
+						{
+							Name: "TRIVY_TIMEOUT",
+							ValueFrom: &corev1.EnvVarSource{
+								ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "trivy-operator-trivy-config",
+									},
+									Key:      "trivy.timeout",
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7123,7 +6402,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.httpsProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7135,7 +6414,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.noProxy",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7147,7 +6426,7 @@ default ignore = false`,
 										Name: "trivy-operator-trivy-config",
 									},
 									Key:      "trivy.javaDbRepository",
-									Optional: pointer.Bool(true),
+									Optional: ptr.To[bool](true),
 								},
 							},
 						},
@@ -7192,13 +6471,13 @@ default ignore = false`,
 						getScanResultVolumeMount(),
 					},
 					SecurityContext: &corev1.SecurityContext{
-						Privileged:               pointer.Bool(false),
-						AllowPrivilegeEscalation: pointer.Bool(false),
+						Privileged:               ptr.To[bool](false),
+						AllowPrivilegeEscalation: ptr.To[bool](false),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"all"},
 						},
-						ReadOnlyRootFilesystem: pointer.Bool(true),
-						RunAsUser:              pointer.Int64(0),
+						ReadOnlyRootFilesystem: ptr.To[bool](true),
+						RunAsUser:              ptr.To[int64](0),
 					},
 				},
 			},
@@ -7226,16 +6505,16 @@ default ignore = false`,
 			resolver := kube.NewObjectResolver(fakeclient, &kube.CompatibleObjectMapper{})
 			instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
 			securityContext := &corev1.SecurityContext{
-				Privileged:               pointer.Bool(false),
-				AllowPrivilegeEscalation: pointer.Bool(false),
+				Privileged:               ptr.To[bool](false),
+				AllowPrivilegeEscalation: ptr.To[bool](false),
 				Capabilities: &corev1.Capabilities{
 					Drop: []corev1.Capability{"all"},
 				},
-				ReadOnlyRootFilesystem: pointer.Bool(true),
+				ReadOnlyRootFilesystem: ptr.To[bool](true),
 				// Root expected for standalone mode - the user would need to know this
-				RunAsUser: pointer.Int64(0),
+				RunAsUser: ptr.To[int64](0),
 			}
-			jobSpec, secrets, err := instance.GetScanJobSpec(pluginContext, tc.workloadSpec, tc.credentials, securityContext)
+			jobSpec, secrets, err := instance.GetScanJobSpec(pluginContext, tc.workloadSpec, tc.credentials, securityContext, make(map[string]v1alpha1.SbomReportData))
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedJobSpec, jobSpec)
 			assert.Equal(t, len(tc.expectedSecretsData), len(secrets))
@@ -7260,6 +6539,12 @@ var (
 		Artifact: v1alpha1.Artifact{
 			Repository: "library/alpine",
 			Tag:        "3.10.2",
+			Digest:     "sha256:72c42ed48c3a2db31b7dafe17d275b634664a708d901ec9fd57b1529280f01fb",
+		},
+		OS: v1alpha1.OS{
+			Family: "alpine",
+			Name:   "3.10.2",
+			Eosl:   true,
 		},
 		Summary: v1alpha1.VulnerabilitySummary{
 			CriticalCount: 0,
@@ -7305,6 +6590,7 @@ var (
 		Artifact: v1alpha1.Artifact{
 			Repository: "library/alpine",
 			Tag:        "3.10.2",
+			Digest:     "sha256:72c42ed48c3a2db31b7dafe17d275b634664a708d901ec9fd57b1529280f01fb",
 		},
 		Summary: v1alpha1.ExposedSecretSummary{
 			CriticalCount: 3,
@@ -7361,6 +6647,12 @@ var (
 		Artifact: v1alpha1.Artifact{
 			Repository: "library/alpine",
 			Tag:        "3.10.2",
+			Digest:     "sha256:72c42ed48c3a2db31b7dafe17d275b634664a708d901ec9fd57b1529280f01fb",
+		},
+		OS: v1alpha1.OS{
+			Family: "alpine",
+			Name:   "3.10.2",
+			Eosl:   true,
 		},
 		Summary: v1alpha1.VulnerabilitySummary{
 			CriticalCount: 0,
@@ -7386,6 +6678,7 @@ var (
 		Artifact: v1alpha1.Artifact{
 			Repository: "library/alpine",
 			Tag:        "3.10.2",
+			Digest:     "sha256:72c42ed48c3a2db31b7dafe17d275b634664a708d901ec9fd57b1529280f01fb",
 		},
 		Summary: v1alpha1.ExposedSecretSummary{
 			CriticalCount: 0,
@@ -7406,6 +6699,8 @@ func TestPlugin_ParseReportData(t *testing.T) {
 		Data: map[string]string{
 			"trivy.repository": "aquasec/trivy",
 			"trivy.tag":        "0.9.1",
+			"trivy.mode":       string(trivy.Standalone),
+			"trivy.command":    string(trivy.Image),
 		},
 	}
 
@@ -7440,7 +6735,7 @@ func TestPlugin_ParseReportData(t *testing.T) {
 			name:                        "Should convert vulnerability report in JSON format when OS is not detected",
 			imageRef:                    "alpine:3.10.2",
 			input:                       `null`,
-			expectedError:               fmt.Errorf("bzip2 data invalid: bad magic value"),
+			expectedError:               errors.New("bzip2 data invalid: bad magic value"),
 			expectedVulnerabilityReport: emptyVulnerabilityReport,
 			expectedExposedSecretReport: emptyExposedSecretReport,
 			compressed:                  "true",
@@ -7480,12 +6775,14 @@ func TestPlugin_ParseReportData(t *testing.T) {
 				WithNamespace("trivyoperator-ns").
 				WithServiceAccountName("trivyoperator-sa").
 				WithClient(fakeClient).
-				WithTrivyOperatorConfig(map[string]string{"scanJob.compressLogs": tc.compressed}).
+				WithTrivyOperatorConfig(map[string]string{
+					"scanJob.compressLogs": tc.compressed,
+					"generateSbomEnabled":  "false",
+				}).
 				Get()
-
 			resolver := kube.NewObjectResolver(fakeClient, &kube.CompatibleObjectMapper{})
 			instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
-			vulnReport, secretReport, err := instance.ParseReportData(ctx, tc.imageRef, io.NopCloser(strings.NewReader(tc.input)))
+			vulnReport, secretReport, _, err := instance.ParseReportData(ctx, tc.imageRef, io.NopCloser(strings.NewReader(tc.input)))
 			switch {
 			case tc.expectedError == nil:
 				require.NoError(t, err)
@@ -7515,7 +6812,7 @@ func TestGetScoreFromCVSS(t *testing.T) {
 					V3Score: 8.3,
 				},
 			},
-			expectedScore: pointer.Float64(8.1),
+			expectedScore: ptr.To[float64](8.1),
 		},
 		{
 			name: "Should return nvd score when vendor v3 score is nil",
@@ -7527,7 +6824,7 @@ func TestGetScoreFromCVSS(t *testing.T) {
 					V3Score: 0.0,
 				},
 			},
-			expectedScore: pointer.Float64(8.1),
+			expectedScore: ptr.To[float64](8.1),
 		},
 		{
 			name: "Should return nvd score when vendor doesn't exist",
@@ -7536,7 +6833,7 @@ func TestGetScoreFromCVSS(t *testing.T) {
 					V3Score: 8.1,
 				},
 			},
-			expectedScore: pointer.Float64(8.1),
+			expectedScore: ptr.To[float64](8.1),
 		},
 		{
 			name: "Should return vendor score when nvd doesn't exist",
@@ -7545,7 +6842,7 @@ func TestGetScoreFromCVSS(t *testing.T) {
 					V3Score: 8.1,
 				},
 			},
-			expectedScore: pointer.Float64(8.1),
+			expectedScore: ptr.To[float64](8.1),
 		},
 		{
 			name: "Should return nil when vendor and nvd both v3 scores are nil",
@@ -7568,7 +6865,7 @@ func TestGetScoreFromCVSS(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			score := trivy.GetScoreFromCVSS(trivy.GetCvssV3(tc.cvss))
+			score := vulnerabilityreport.GetScoreFromCVSS(vulnerabilityreport.GetCvssV3(tc.cvss))
 			assert.Equal(t, tc.expectedScore, score)
 		})
 	}
@@ -7578,7 +6875,7 @@ func TestGetCVSSV3(t *testing.T) {
 	testCases := []struct {
 		name     string
 		cvss     dbtypes.VendorCVSS
-		expected map[string]*trivy.CVSS
+		expected map[string]*vulnerabilityreport.CVSS
 	}{
 		{
 			name: "Should return vendor score when vendor v3 score exist",
@@ -7590,9 +6887,9 @@ func TestGetCVSSV3(t *testing.T) {
 					V3Score: 8.3,
 				},
 			},
-			expected: map[string]*trivy.CVSS{
-				"nvd":    {V3Score: pointer.Float64(8.1)},
-				"redhat": {V3Score: pointer.Float64(8.3)},
+			expected: map[string]*vulnerabilityreport.CVSS{
+				"nvd":    {V3Score: ptr.To[float64](8.1)},
+				"redhat": {V3Score: ptr.To[float64](8.3)},
 			},
 		},
 		{
@@ -7605,7 +6902,7 @@ func TestGetCVSSV3(t *testing.T) {
 					V3Score: 0.0,
 				},
 			},
-			expected: map[string]*trivy.CVSS{
+			expected: map[string]*vulnerabilityreport.CVSS{
 				"nvd":    {V3Score: nil},
 				"redhat": {V3Score: nil},
 			},
@@ -7613,54 +6910,14 @@ func TestGetCVSSV3(t *testing.T) {
 		{
 			name:     "Should return nil when cvss doesn't exist",
 			cvss:     dbtypes.VendorCVSS{},
-			expected: map[string]*trivy.CVSS{},
+			expected: make(map[string]*vulnerabilityreport.CVSS),
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			score := trivy.GetCvssV3(tc.cvss)
+			score := vulnerabilityreport.GetCvssV3(tc.cvss)
 			assert.True(t, reflect.DeepEqual(tc.expected, score))
-		})
-	}
-}
-
-func TestGetMirroredImage(t *testing.T) {
-	testCases := []struct {
-		name          string
-		image         string
-		mirrors       map[string]string
-		expected      string
-		expectedError string
-	}{
-		{
-			name:     "Mirror not match",
-			image:    "alpine",
-			mirrors:  map[string]string{"gcr.io": "mirror.io"},
-			expected: "alpine",
-		},
-		{
-			name:     "Mirror match",
-			image:    "alpine",
-			mirrors:  map[string]string{"index.docker.io": "mirror.io"},
-			expected: "mirror.io/library/alpine:latest",
-		},
-		{
-			name:          "Broken image",
-			image:         "alpine@sha256:broken",
-			expectedError: "could not parse reference: alpine@sha256:broken",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			expected, err := trivy.GetMirroredImage(tc.image, tc.mirrors)
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expected, expected)
-			}
 		})
 	}
 }
@@ -7767,8 +7024,8 @@ func TestGetContainers(t *testing.T) {
 				Get()
 			resolver := kube.NewObjectResolver(fakeclient, &kube.CompatibleObjectMapper{})
 			instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
-			jobSpec, _, err := instance.GetScanJobSpec(pluginContext, workloadSpec, nil, nil)
-			assert.NoError(t, err)
+			jobSpec, _, err := instance.GetScanJobSpec(pluginContext, workloadSpec, nil, nil, make(map[string]v1alpha1.SbomReportData))
+			require.NoError(t, err)
 
 			containers := make([]string, 0)
 
@@ -7783,82 +7040,132 @@ func TestGetContainers(t *testing.T) {
 	}
 }
 
-func TestPlugin_FindIgnorePolicyKey(t *testing.T) {
-	workload := &appsv1.ReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "name-01234abcd",
-			Namespace: "namespace",
+func TestGetInitContainers(t *testing.T) {
+	workloadSpec := &appsv1.ReplicaSet{
+		Spec: appsv1.ReplicaSetSpec{
+			Template: corev1.PodTemplateSpec{
+
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "container1", Image: "busybox:1.34.1"},
+					},
+				},
+			},
 		},
 	}
+
 	testCases := []struct {
-		name        string
-		configData  map[string]string
-		expectedKey string
+		name       string
+		configData map[string]string
 	}{
 		{
-			name: "empty",
+			name: "Standalone mode with image command java-db from private registry",
 			configData: map[string]string{
-				"other": "",
+				"trivy.dbRepository":     trivy.DefaultDBRepository,
+				"trivy.javaDbRepository": "my-private-registry.io/aquasec/trivy-java-db",
+				"trivy.skipJavaDBUpdate": "false",
+				"trivy.repository":       "gcr.io/aquasec/trivy",
+				"trivy.tag":              "0.35.0",
+				"trivy.mode":             string(trivy.Standalone),
+				"trivy.command":          string(trivy.Image),
 			},
-			expectedKey: "",
-		},
-		{
-			name: "fallback",
-			configData: map[string]string{
-				"other":              "",
-				"trivy.ignorePolicy": "",
-			},
-			expectedKey: "trivy.ignorePolicy",
-		},
-		{
-			name: "fallback namespace",
-			configData: map[string]string{
-				"other":                        "",
-				"trivy.ignorePolicy":           "",
-				"trivy.ignorePolicy.namespace": "",
-			},
-			expectedKey: "trivy.ignorePolicy.namespace",
-		},
-		{
-			name: "fallback namespace workload",
-			configData: map[string]string{
-				"other":                               "",
-				"trivy.ignorePolicy":                  "",
-				"trivy.ignorePolicy.namespace":        "",
-				"trivy.ignorePolicy.namespace.name-*": "",
-			},
-			expectedKey: "trivy.ignorePolicy.namespace.name-*",
-		},
-		{
-			name: "fallback namespace other-workload",
-			configData: map[string]string{
-				"other":                        "",
-				"trivy.ignorePolicy":           "",
-				"trivy.ignorePolicy.namespace": "",
-				"trivy.ignorePolicy.namespace.name-other-*": "",
-			},
-			expectedKey: "trivy.ignorePolicy.namespace",
-		},
-		{
-			name: "fallback other-namespace other-workload",
-			configData: map[string]string{
-				"other":                              "",
-				"trivy.ignorePolicy":                 "",
-				"trivy.ignorePolicy.namespace-other": "",
-				"trivy.ignorePolicy.namespace-other.name-other-*": "",
-			},
-			expectedKey: "trivy.ignorePolicy",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			config := trivy.Config{
-				trivyoperator.PluginConfig{
+			fakeclient := fake.NewClientBuilder().WithObjects(
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trivy-operator-trivy-config",
+						Namespace: "trivyoperator-ns",
+					},
 					Data: tc.configData,
 				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trivy-operator-trivy-config",
+						Namespace: "trivyoperator-ns",
+					},
+					Data: map[string][]byte{
+						"trivy.dbRepositoryUsername": []byte("my-username"),
+						"trivy.dbRepositoryPassword": []byte("my-password"),
+					},
+				},
+			).Build()
+
+			pluginContext := trivyoperator.NewPluginContext().
+				WithName(trivy.Plugin).
+				WithNamespace("trivyoperator-ns").
+				WithServiceAccountName("trivyoperator-sa").
+				WithClient(fakeclient).
+				Get()
+
+			config, err := pluginContext.GetConfig()
+			if err != nil {
+				t.Fatalf("failed to get config: %v", err)
 			}
-			assert.Equal(t, tc.expectedKey, config.FindIgnorePolicyKey(workload))
+			config.SecretData = map[string][]byte{
+				"my-username": []byte("my-username"),
+				"my-password": []byte("my-password"),
+			}
+
+			resolver := kube.NewObjectResolver(fakeclient, &kube.CompatibleObjectMapper{})
+			instance := trivy.NewPlugin(fixedClock, ext.NewSimpleIDGenerator(), &resolver)
+			jobSpec, _, err := instance.GetScanJobSpec(pluginContext, workloadSpec, nil, nil, make(map[string]v1alpha1.SbomReportData))
+			require.NoError(t, err)
+
+			assert.Len(t, jobSpec.InitContainers, 2)
+			// Assert first init container to download trivy-db from private registry
+			trivyDbInitContainer := jobSpec.InitContainers[0]
+
+			containsDownloadDBOnly := false
+			for _, arg := range trivyDbInitContainer.Args {
+				if arg == "--download-db-only" {
+					containsDownloadDBOnly = true
+					break
+				}
+			}
+			assert.True(t, containsDownloadDBOnly, "Expected first init container to only download try-db")
+
+			hasTrivyUsername := false
+			hasTrivyPassword := false
+			for _, envVar := range trivyDbInitContainer.Env {
+				if envVar.Name == "TRIVY_USERNAME" {
+					hasTrivyUsername = true
+				}
+				if envVar.Name == "TRIVY_PASSWORD" {
+					hasTrivyPassword = true
+				}
+			}
+			assert.True(t, hasTrivyUsername, "Expected init container to have username env var for private trivy-db registry")
+			assert.True(t, hasTrivyPassword, "Expected init container to have password env var for private trivy-db registry")
+
+			// Assert second init container to download java-db from private registry
+			javaDbInitContainer := jobSpec.InitContainers[1]
+
+			containsDownloadJavaDBOnly := false
+			for _, arg := range javaDbInitContainer.Args {
+				if arg == "--download-java-db-only" {
+					containsDownloadJavaDBOnly = true
+					break
+				}
+			}
+			assert.True(t, containsDownloadJavaDBOnly, "Expected second init container to only download java-db")
+
+			hasTrivyUsername = false
+			hasTrivyPassword = false
+			for _, envVar := range javaDbInitContainer.Env {
+				if envVar.Name == "TRIVY_USERNAME" {
+					hasTrivyUsername = true
+				}
+				if envVar.Name == "TRIVY_PASSWORD" {
+					hasTrivyPassword = true
+				}
+			}
+			assert.True(t, hasTrivyUsername, "Expected init container to have username env var for private java-db registry")
+			assert.True(t, hasTrivyPassword, "Expected init container to have password env var for private java-db registry")
+
 		})
 	}
 }
@@ -8020,7 +7327,7 @@ func TestSkipDirFileEnvVars(t *testing.T) {
 							Name: "trivy-operator-trivy-config",
 						},
 						Key:      "trivy.skipFiles",
-						Optional: pointer.Bool(true),
+						Optional: ptr.To[bool](true),
 					},
 				},
 			},
@@ -8089,7 +7396,7 @@ func TestSkipDirFileEnvVars(t *testing.T) {
 							Name: "trivy-operator-trivy-config",
 						},
 						Key:      "trivy.skipDirs",
-						Optional: pointer.Bool(true),
+						Optional: ptr.To[bool](true),
 					},
 				},
 			},
@@ -8098,7 +7405,227 @@ func TestSkipDirFileEnvVars(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := trivy.ConfigWorkloadAnnotationEnvVars(tc.workload, tc.skipType, tc.envKey, tc.configName, tc.configKey)
-			assert.Equal(t, got, tc.want)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestGetClientServerSkipUpdate(t *testing.T) {
+	testCases := []struct {
+		name       string
+		configData trivy.Config
+		want       bool
+	}{
+		{
+			name: "clientServerSkipUpdate param set to true",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.clientServerSkipUpdate": "true",
+				},
+			}},
+			want: true,
+		},
+		{
+			name: "clientServerSkipUpdate param set to false",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.clientServerSkipUpdate": "false",
+				},
+			}},
+			want: false,
+		},
+		{
+			name: "clientServerSkipUpdate param set to no valid value",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.clientServerSkipUpdate": "false2",
+				},
+			}},
+			want: false,
+		},
+		{
+			name: "clientServerSkipUpdate param set to no value",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: make(map[string]string),
+			}},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.configData.GetClientServerSkipUpdate()
+			assert.Equal(t, tc.want, got)
+
+		})
+	}
+}
+
+func TestGetSkipJavaDBUpdate(t *testing.T) {
+	testCases := []struct {
+		name       string
+		configData trivy.Config
+		want       bool
+	}{
+		{
+			name: "skipJavaDBUpdate param set to true",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.skipJavaDBUpdate": "true",
+				},
+			}},
+			want: true,
+		},
+		{
+			name: "skipJavaDBUpdate param set to false",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.skipJavaDBUpdate": "false",
+				},
+			}},
+			want: false,
+		},
+		{
+			name: "skipJavaDBUpdate param set to no valid value",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.skipJavaDBUpdate": "false2",
+				},
+			}},
+			want: false,
+		},
+		{
+			name: "skipJavaDBUpdate param set to no  value",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: make(map[string]string),
+			}},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.configData.GetSkipJavaDBUpdate()
+			assert.Equal(t, tc.want, got)
+
+		})
+	}
+}
+
+func TestGetImageScanCacheDir(t *testing.T) {
+	testCases := []struct {
+		name       string
+		configData trivy.Config
+		want       string
+	}{
+		{
+			name: "imageScanCacheDir param set non-default path",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.imageScanCacheDir": "/home/trivy/.cache",
+				},
+			}},
+			want: "/home/trivy/.cache",
+		},
+		{
+			name: "imageScanCacheDir param set as empty string",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.imageScanCacheDir": "",
+				},
+			}},
+			want: "/tmp/trivy/.cache",
+		},
+		{
+			name: "imageScanCacheDir param unset",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: make(map[string]string),
+			}},
+			want: "/tmp/trivy/.cache",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.configData.GetImageScanCacheDir()
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestGetFilesystemScanCacheDir(t *testing.T) {
+	testCases := []struct {
+		name       string
+		configData trivy.Config
+		want       string
+	}{
+		{
+			name: "filesystemScanCacheDir param set non-default path",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.filesystemScanCacheDir": "/home/trivyoperator/trivy-db",
+				},
+			}},
+			want: "/home/trivyoperator/trivy-db",
+		},
+		{
+			name: "filesystemScanCacheDir param set as empty string",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: map[string]string{
+					"trivy.filesystemScanCacheDir": "",
+				},
+			}},
+			want: "/var/trivyoperator/trivy-db",
+		},
+		{
+			name: "filesystemScanCacheDir param unset",
+			configData: trivy.Config{PluginConfig: trivyoperator.PluginConfig{
+				Data: make(map[string]string),
+			}},
+			want: "/var/trivyoperator/trivy-db",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.configData.GetFilesystemScanCacheDir()
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestExcludeImages(t *testing.T) {
+	testCases := []struct {
+		name           string
+		excludePattern []string
+		imageName      string
+		want           bool
+	}{
+		{
+			name:           "exclude images single pattern match",
+			excludePattern: []string{"docker.io/*/*"},
+			imageName:      "docker.io/library/alpine:3.10.2",
+			want:           true,
+		},
+		{
+			name:           "exclude images multi pattern match",
+			excludePattern: []string{"docker.io/*/*", "k8s.gcr.io/*/*"},
+			imageName:      "k8s.gcr.io/coredns/coredns:v1.8.0",
+			want:           true,
+		},
+		{
+			name:           "exclude images multi pattern no match",
+			excludePattern: []string{"docker.io/*", "ecr.io/*/*"},
+			imageName:      "docker.io/library/alpine:3.10.2",
+			want:           false,
+		},
+		{
+			name:           "exclude images no pattern",
+			excludePattern: []string{},
+			imageName:      "docker.io/library/alpine:3.10.2",
+			want:           false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trivy.ExcludeImage(tc.excludePattern, tc.imageName)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }

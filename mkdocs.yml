@@ -33,6 +33,7 @@ nav:
           - Webhook Integration: tutorials/integrations/webhook.md
           - Policy Reporter Integration: tutorials/integrations/policy-reporter.md
   - Docs:
+      - Overview: docs/index.md
       - Vulnerability Scanning:
           - Overview: docs/vulnerability-scanning/index.md
           - Trivy Scanner: docs/vulnerability-scanning/trivy.md
@@ -41,7 +42,7 @@ nav:
       - Configuration Auditing:
           - Overview: docs/configuration-auditing/index.md
           - Built-in Configuration Audit Policies: docs/configuration-auditing/built-in-policies.md
-      - Complaince Report:
+      - Compliance Report:
           - Overview: docs/compliance/compliance.md
       - Custom Resource Definitions:
           - Overview: docs/crds/index.md
@@ -51,6 +52,8 @@ nav:
           - RbacAssessmentReport: docs/crds/rbacassessment-report.md
           - InfraAssessmentReport: docs/crds/infraassessment-report.md
           - ClusterComplianceReport: docs/crds/clustercompliance-report.md
+          - ClusterVulnerabilityReport: docs/crds/clustervulnerability-report.md
+          - SbomReport: docs/crds/sbom-report.md
   - Frequently Asked Questions: faq.md
 
 theme:
@@ -85,9 +88,17 @@ extra:
   version:
     method: mike
     provider: mike
+    default: latest
   var:
-    prev_git_tag: "v0.13.1"
-    chart_version: "0.13.2"
+    prev_git_tag: "v0.24.0"
+    chart_version: "0.26.0"
+  social:
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/AquaTrivy
+    - icon: fontawesome/brands/github
+      link: https://github.com/aquasecurity/trivy
+    - icon: fontawesome/brands/slack
+      link: https://github.com/aquasecurity/trivy
 
 plugins:
   - search

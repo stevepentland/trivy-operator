@@ -4,19 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	rbacv1 "k8s.io/api/rbac/v1"
-
-	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
-
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/ext"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -24,6 +15,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
+	"github.com/aquasecurity/trivy-operator/pkg/ext"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
+	"github.com/aquasecurity/trivy-operator/pkg/policy"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 // PolicyConfigController watches changes on policies config map and generates
@@ -34,7 +34,9 @@ type PolicyConfigController struct {
 	etc.Config
 	kube.ObjectResolver
 	trivyoperator.PluginContext
+	PolicyLoader policy.Loader
 	configauditreport.PluginInMemory
+	ClusterVersion string
 }
 
 // Controller for trivy-operator-policies-config in the operator namespace; must be cluster scoped even with namespace predicate
@@ -118,7 +120,7 @@ func (r *PolicyConfigController) reconcileConfig(kind kube.Kind) reconcile.Func 
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger)
+		policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger, r.PolicyLoader, r.ClusterVersion)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting policies: %w", err)
 		}
@@ -208,7 +210,7 @@ func (r *PolicyConfigController) reconcileClusterConfig(kind kube.Kind) reconcil
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger)
+		policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger, r.PolicyLoader)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting policies: %w", err)
 		}

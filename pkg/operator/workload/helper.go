@@ -5,11 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/go-logr/logr"
-	"golang.org/x/exp/maps"
+	maps "github.com/samber/lo"
 	"golang.org/x/net/context"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -18,6 +15,10 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/strings/slices"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 func SkipProcessing(ctx context.Context, resource client.Object, or kube.ObjectResolver, scanOnlyCurrentRevisions bool, log logr.Logger, skipResourceLabels []string) (bool, error) {
@@ -63,6 +64,21 @@ func SkipProcessing(ctx context.Context, resource client.Object, or kube.ObjectR
 			}
 			return true, err
 		}
+		if scanOnlyCurrentRevisions {
+			controller := metav1.GetControllerOf(resource)
+			activeReplicationController, err := or.IsActiveReplicationController(ctx, resource, controller)
+			if err != nil {
+				return true, fmt.Errorf("failed checking current revision: %w", err)
+			}
+			if !activeReplicationController {
+				log.V(1).Info("Ignoring inactive ReplicationController", "controllerKind", controller.Kind, "controllerName", controller.Name)
+				err := MarkOldReportForImmediateDeletion(ctx, or, resource.GetNamespace(), resource.GetName())
+				if err != nil {
+					return true, fmt.Errorf("failed marking old reports for immediate deletion : %w", err)
+				}
+				return true, nil
+			}
+		}
 	case *appsv1.StatefulSet:
 		_, err := or.GetActivePodsMatchingLabels(ctx, resource.GetNamespace(), r.Spec.Selector.MatchLabels)
 		if err != nil {
@@ -79,6 +95,13 @@ func SkipProcessing(ctx context.Context, resource client.Object, or kube.ObjectR
 			log.V(1).Info("Ignoring managed pod",
 				"controllerKind", controller.Kind,
 				"controllerName", controller.Name)
+			return true, nil
+		}
+		annotations := resource.GetAnnotations()
+		// Ignore scanning of system pod which is created for deploymentConfig
+		if value, ok := annotations[kube.DeployerPodForDeploymentAnnotation]; ok {
+			log.V(1).Info("Ignoring system pod created for deployment config",
+				"deploymentConfigName", value)
 			return true, nil
 		}
 	case *batchv1.Job:
@@ -105,7 +128,7 @@ func GetReportsByLabel(ctx context.Context, resolver kube.ObjectResolver, object
 }
 
 // MarkOldReportForImmediateDeletion set old (historical replicaSets) reports with TTL = 0 for immediate deletion
-func MarkOldReportForImmediateDeletion(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceName string) error {
+func MarkOldReportForImmediateDeletion(ctx context.Context, resolver kube.ObjectResolver, namespace, resourceName string) error {
 	annotation := map[string]string{
 		v1alpha1.TTLReportAnnotation: time.Duration(0).String(),
 	}
@@ -122,10 +145,14 @@ func MarkOldReportForImmediateDeletion(ctx context.Context, resolver kube.Object
 	if err != nil {
 		return err
 	}
+	err = markOldSbomReport(ctx, resolver, namespace, resourceNameLabels, annotation)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
-func markOldVulnerabilityReports(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels map[string]string, annotation map[string]string) error {
+func markOldVulnerabilityReports(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels, annotation map[string]string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var vulnerabilityReportList v1alpha1.VulnerabilityReportList
 		err := GetReportsByLabel(ctx, resolver, &vulnerabilityReportList, namespace, resourceNameLabels)
@@ -142,7 +169,7 @@ func markOldVulnerabilityReports(ctx context.Context, resolver kube.ObjectResolv
 	})
 }
 
-func markOldConfigAuditReports(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels map[string]string, annotation map[string]string) error {
+func markOldConfigAuditReports(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels, annotation map[string]string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var configAuditReportList v1alpha1.ConfigAuditReportList
 		err := GetReportsByLabel(ctx, resolver, &configAuditReportList, namespace, resourceNameLabels)
@@ -159,7 +186,7 @@ func markOldConfigAuditReports(ctx context.Context, resolver kube.ObjectResolver
 	})
 }
 
-func markOldExposeSecretsReport(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels map[string]string, annotation map[string]string) error {
+func markOldExposeSecretsReport(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels, annotation map[string]string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var exposeSecretReportList v1alpha1.ExposedSecretReportList
 		err := GetReportsByLabel(ctx, resolver, &exposeSecretReportList, namespace, resourceNameLabels)
@@ -167,6 +194,23 @@ func markOldExposeSecretsReport(ctx context.Context, resolver kube.ObjectResolve
 			return err
 		}
 		for _, report := range exposeSecretReportList.Items {
+			err := markReportTTL(ctx, resolver, report.DeepCopy(), annotation)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func markOldSbomReport(ctx context.Context, resolver kube.ObjectResolver, namespace string, resourceNameLabels, annotation map[string]string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var sbomReportList v1alpha1.SbomReportList
+		err := GetReportsByLabel(ctx, resolver, &sbomReportList, namespace, resourceNameLabels)
+		if err != nil {
+			return err
+		}
+		for _, report := range sbomReportList.Items {
 			err := markReportTTL(ctx, resolver, report.DeepCopy(), annotation)
 			if err != nil {
 				return err

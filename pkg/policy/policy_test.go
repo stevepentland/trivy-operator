@@ -6,23 +6,28 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/aquasecurity/defsec/pkg/scan"
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
-	"github.com/aquasecurity/trivy-operator/pkg/policy"
-	"github.com/aquasecurity/trivy-operator/pkg/utils"
-	. "github.com/onsi/gomega"
+	"github.com/bluele/gcache"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
+	"github.com/aquasecurity/trivy-operator/pkg/policy"
+	"github.com/aquasecurity/trivy-operator/pkg/utils"
+	"github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/iac/scan"
+
+	. "github.com/onsi/gomega"
 )
 
 func TestPolicies_PoliciesByKind(t *testing.T) {
@@ -32,7 +37,7 @@ func TestPolicies_PoliciesByKind(t *testing.T) {
 			"library.kubernetes.rego":        "<REGO_A>",
 			"library.utils.rego":             "<REGO_B>",
 			"policy.access_to_host_pid.rego": "<REGO_C>",
-		}, testConfig{}, ctrl.Log.WithName("policy logger"))
+		}, testConfig{}, ctrl.Log.WithName("policy logger"), policy.NewPolicyLoader("", gcache.New(1).LRU().Build(), types.RegistryOptions{}), "1.27.1")
 		_, err := config.PoliciesByKind("Pod")
 		g.Expect(err).To(MatchError("kinds not defined for policy: policy.access_to_host_pid.rego"))
 	})
@@ -41,7 +46,7 @@ func TestPolicies_PoliciesByKind(t *testing.T) {
 		g := NewGomegaWithT(t)
 		config := policy.NewPolicies(map[string]string{
 			"policy.access_to_host_pid.kinds": "Workload",
-		}, testConfig{}, ctrl.Log.WithName("policy logger"))
+		}, testConfig{}, ctrl.Log.WithName("policy logger"), policy.NewPolicyLoader("", gcache.New(1).LRU().Build(), types.RegistryOptions{}), "1.27.1")
 		_, err := config.PoliciesByKind("Pod")
 		g.Expect(err).To(MatchError("expected policy not found: policy.access_to_host_pid.rego"))
 	})
@@ -68,7 +73,7 @@ func TestPolicies_PoliciesByKind(t *testing.T) {
 			"policy.privileged": "<REGO_E>",
 			// This one should be skipped (no policy. prefix)
 			"foo": "bar",
-		}, testConfig{}, ctrl.Log.WithName("policy logger"))
+		}, testConfig{}, ctrl.Log.WithName("policy logger"), policy.NewPolicyLoader("", gcache.New(1).LRU().Build(), types.RegistryOptions{}), "1.27.1")
 		g.Expect(config.PoliciesByKind("Pod")).To(Equal(map[string]string{
 			"policy.access_to_host_pid.rego":                "<REGO_C>",
 			"policy.cpu_not_limited.rego":                   "<REGO_D>",
@@ -93,7 +98,7 @@ func TestPolicies_Supported(t *testing.T) {
 	}{
 		{
 			name: "Should return true for workload policies",
-			data: map[string]string{},
+			data: make(map[string]string),
 			resource: &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "Pod",
@@ -142,82 +147,7 @@ func TestPolicies_Supported(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewGomegaWithT(t)
 			log := ctrl.Log.WithName("resourcecontroller")
-			ready, err := policy.NewPolicies(tc.data, testConfig{}, log).SupportedKind(tc.resource, tc.rbacEnable)
-			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(ready).To(Equal(tc.expected))
-		})
-	}
-
-}
-
-func TestPolicies_Applicable(t *testing.T) {
-
-	testCases := []struct {
-		name       string
-		data       map[string]string
-		resource   client.Object
-		rbacEnable bool
-		expected   bool
-	}{
-		{
-			name: "Should return true for workload policies",
-			data: map[string]string{
-				"library.utils.rego": `package lib.utils
-
-has_key(x, k) {
-  _ = x[k]
-}`,
-				"policy.policy1.kinds": "Workload",
-				"policy.policy1.rego": `package appshield.kubernetes.KSV014
-
-__rego_metadata__ := {
-	"id": "KSV014",
-	"title": "Root file system is not read-only",
-	"description": "An immutable root file system prevents applications from writing to their local disk",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check"
-}
-
-deny[res] {
-	input.kind == "Deployment"
-	not input.spec.template.spec.securityContext.runAsNonRoot
-
-	msg := "Containers must not run as root"
-
-	res := {
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-		"msg": msg
-	}
-}
-`},
-			resource: &corev1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Should return true if Pod kind and rbac disable",
-			resource: &corev1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
-			},
-			expected: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewGomegaWithT(t)
-			log := ctrl.Log.WithName("resourcecontroller")
-			ready, _, err := policy.NewPolicies(tc.data, testConfig{builtInPolicies: false}, log).Applicable(tc.resource.GetObjectKind().GroupVersionKind().Kind)
+			ready, err := policy.NewPolicies(tc.data, testConfig{}, log, policy.NewPolicyLoader("", gcache.New(1).LRU().Build(), types.RegistryOptions{}), "1.27.1").SupportedKind(tc.resource, tc.rbacEnable)
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(ready).To(Equal(tc.expected))
 		})
@@ -258,35 +188,35 @@ func TestPolicies_Eval(t *testing.T) {
 			policies: map[string]string{
 				"library.utils.rego": `package lib.utils
 
-has_key(x, k) {
-  _ = x[k]
-}`,
+		has_key(x, k) {
+		  _ = x[k]
+		}`,
 				"policy.policy1.kinds": "Workload",
 				"policy.policy1.rego": `package appshield.kubernetes.KSV014
 
-__rego_metadata__ := {
-	"id": "KSV014",
-	"title": "Root file system is not read-only",
-	"description": "An immutable root file system prevents applications from writing to their local disk",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check"
-}
+		__rego_metadata__ := {
+			"id": "KSV014",
+			"title": "Root file system is not read-only",
+			"description": "An immutable root file system prevents applications from writing to their local disk",
+			"severity": "LOW",
+			"type": "Kubernetes Security Check"
+		}
 
-deny[res] {
-	input.kind == "Deployment"
-	not input.spec.template.spec.securityContext.runAsNonRoot
+		deny[res] {
+			input.kind == "Deployment"
+			not input.spec.template.spec.securityContext.runAsNonRoot
 
-	msg := "Containers must not run as root"
+			msg := "Containers must not run as root"
 
-	res := {
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-		"msg": msg
-	}
-}
-`,
+			res := {
+				"id": __rego_metadata__.id,
+				"title": __rego_metadata__.title,
+				"severity": __rego_metadata__.severity,
+				"type": __rego_metadata__.type,
+				"msg": msg
+			}
+		}
+		`,
 			},
 			results: []Result{
 				{
@@ -313,7 +243,7 @@ deny[res] {
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							SecurityContext: &corev1.PodSecurityContext{
-								RunAsNonRoot: pointer.Bool(true),
+								RunAsNonRoot: ptr.To[bool](true),
 							},
 							Containers: []corev1.Container{
 								{
@@ -329,35 +259,35 @@ deny[res] {
 			policies: map[string]string{
 				"library.utils.rego": `package lib.utils
 
-has_key(x, k) {
-  _ = x[k]
-}`,
+		has_key(x, k) {
+		  _ = x[k]
+		}`,
 				"policy.policy1.kinds": "Workload",
 				"policy.policy1.rego": `package appshield.kubernetes.KSV014
 
-__rego_metadata__ := {
-	"id": "KSV014",
-	"title": "Root file system is not read-only",
-	"description": "An immutable root file system prevents applications from writing to their local disk",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check"
-}
+		__rego_metadata__ := {
+			"id": "KSV014",
+			"title": "Root file system is not read-only",
+			"description": "An immutable root file system prevents applications from writing to their local disk",
+			"severity": "LOW",
+			"type": "Kubernetes Security Check"
+		}
 
-deny[res] {
-	input.kind == "Deployment"
-	not input.spec.template.spec.securityContext.runAsNonRoot
+		deny[res] {
+			input.kind == "Deployment"
+			not input.spec.template.spec.securityContext.runAsNonRoot
 
-	msg := "Containers must not run as root"
+			msg := "Containers must not run as root"
 
-	res := {
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-		"msg": msg
-	}
-}
-`,
+			res := {
+				"id": __rego_metadata__.id,
+				"title": __rego_metadata__.title,
+				"severity": __rego_metadata__.severity,
+				"type": __rego_metadata__.type,
+				"msg": msg
+			}
+		}
+		`,
 			},
 			results: []Result{
 				{
@@ -371,155 +301,6 @@ deny[res] {
 					},
 				},
 			},
-		},
-		{
-			name: "Should eval warn rule with invalid resource as failed check",
-			resource: &appsv1.Deployment{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Deployment",
-					APIVersion: "appsv1",
-				},
-				Spec: appsv1.DeploymentSpec{
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{
-									Name:  "nginx",
-									Image: "nginx:1.16",
-								},
-							},
-						},
-					},
-				},
-			},
-			useBuiltInPolicies: false,
-			policies: map[string]string{
-				"library.utils.rego": `package lib.utils
-
-has_key(x, k) {
-  _ = x[k]
-}`,
-				"policy.policy1.kinds": "Workload",
-				"policy.policy1.rego": `package appshield.kubernetes.KSV014
-
-__rego_metadata__ := {
-	"id": "KSV014",
-	"title": "Root file system is not read-only",
-	"description": "An immutable root file system prevents applications from writing to their local disk",
-	"severity": "MEDIUM",
-	"type": "Kubernetes Security Check"
-}
-
-warn[res] {
-	input.kind == "Deployment"
-	not input.spec.template.spec.securityContext.runAsNonRoot
-
-	msg := "Containers must not run as root"
-
-	res := {
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-		"msg": msg
-	}
-}
-`,
-			},
-			results: []Result{
-				{
-					Success: false,
-					Metadata: Metadata{
-						ID:          "KSV014",
-						Title:       "Root file system is not read-only",
-						Description: "An immutable root file system prevents applications from writing to their local disk",
-						Severity:    v1alpha1.SeverityMedium,
-						Type:        "Kubernetes Security Check",
-					},
-					Messages: []string{"Containers must not run as root"},
-				},
-			},
-		},
-		{
-			name: "Should eval warn rule with valid resource as successful check",
-			resource: &appsv1.Deployment{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Deployment",
-					APIVersion: "appsv1",
-				},
-				Spec: appsv1.DeploymentSpec{
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							SecurityContext: &corev1.PodSecurityContext{
-								RunAsNonRoot: pointer.Bool(true),
-							},
-							Containers: []corev1.Container{
-								{
-									Name:  "nginx",
-									Image: "nginx:1.16",
-								},
-							},
-						},
-					},
-				},
-			},
-			useBuiltInPolicies: false,
-			policies: map[string]string{
-				"library.utils.rego": `package lib.utils
-
-has_key(x, k) {
-  _ = x[k]
-}`,
-				"policy.policy1.kinds": "Workload",
-				"policy.policy1.rego": `package appshield.kubernetes.KSV014
-
-__rego_metadata__ := {
-	"id": "KSV014",
-	"title": "Root file system is not read-only",
-	"description": "An immutable root file system prevents applications from writing to their local disk",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check"
-}
-
-warn[res] {
-	input.kind == "Deployment"
-	not input.spec.template.spec.securityContext.runAsNonRoot
-
-	msg := "Containers must not run as root"
-
-	res := {
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-		"msg": msg
-	}
-}
-`,
-			},
-			results: []Result{
-				{
-					Success: true,
-					Metadata: Metadata{
-						ID:          "KSV014",
-						Severity:    v1alpha1.SeverityLow,
-						Title:       "Root file system is not read-only",
-						Description: "An immutable root file system prevents applications from writing to their local disk",
-						Type:        "Kubernetes Security Check",
-					},
-				},
-			},
-		},
-		{
-			name:          "Should return error when resource is nil",
-			resource:      nil,
-			expectedError: "resource must not be nil",
-		},
-		{
-			name:          "Should return error when resource kind is blank",
-			resource:      &appsv1.Deployment{},
-			policies:      map[string]string{},
-			expectedError: "resource kind must not be blank",
 		},
 		{
 			name: "Should return error when policy cannot be parsed",
@@ -534,7 +315,7 @@ warn[res] {
 				"policy.invalid.kinds": "Workload",
 				"policy.invalid.rego":  "$^&!",
 			},
-			expectedError: "failed to load rego policies from [externalPolicies]: 1 error occurred: externalPolicies/file_0.rego:1: rego_parse_error: illegal token\n\t$^&!\n\t^",
+			expectedError: `failed to load rego policies from [externalPolicies]: 1 error occurred: externalPolicies/file_0.rego:1: rego_parse_error: illegal token\\n\\t$^&!\\n\\t^`,
 		},
 		{
 			name: "Should return error when library cannot be parsed",
@@ -547,7 +328,7 @@ warn[res] {
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							SecurityContext: &corev1.PodSecurityContext{
-								RunAsNonRoot: pointer.Bool(true),
+								RunAsNonRoot: ptr.To[bool](true),
 							},
 							Containers: []corev1.Container{
 								{
@@ -563,7 +344,7 @@ warn[res] {
 			policies: map[string]string{
 				"library.utils.rego": "$^&!",
 			},
-			expectedError: "failed to load rego policies from [externalPolicies]: 1 error occurred: externalPolicies/file_0.rego:1: rego_parse_error: illegal token\n\t$^&!\n\t^",
+			expectedError: `failed to load rego policies from [externalPolicies]: 1 error occurred: externalPolicies/file_0.rego:1: rego_parse_error: illegal token\\n\\t$^&!\\n\\t^`,
 		},
 		{
 			name:          "Should eval deny rule with any resource and multiple messages",
@@ -591,33 +372,33 @@ warn[res] {
 				"policy.uses_image_tag_latest.kinds": "Workload",
 				"policy.uses_image_tag_latest.rego": `package test
 
-__rego_metadata__ := {
-	"id": "KSV013",
-	"avd_id": "AVD-KSV-0013",
-	"title": "Image tag ':latest' used",
-	"short_code": "use-specific-tags",
-	"version": "v1.0.0",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check",
-	"description": "It is best to avoid using the ':latest' image tag when deploying containers in production. Doing so makes it hard to track which version of the image is running, and hard to roll back the version.",
-	"recommended_actions": "Use a specific container image tag that is not 'latest'.",
-	"url": "https://kubernetes.io/docs/concepts/configuration/overview/#container-images",
-}
+		__rego_metadata__ := {
+			"id": "KSV013",
+			"avd_id": "AVD-KSV-0013",
+			"title": "Image tag ':latest' used",
+			"short_code": "use-specific-tags",
+			"version": "v1.0.0",
+			"severity": "LOW",
+			"type": "Kubernetes Security Check",
+			"description": "It is best to avoid using the ':latest' image tag when deploying containers in production. Doing so makes it hard to track which version of the image is running, and hard to roll back the version.",
+			"recommended_actions": "Use a specific container image tag that is not 'latest'.",
+			"url": "https://kubernetes.io/docs/concepts/configuration/overview/#container-images",
+		}
 
-messages = [ "msg1", "msg2" ]
+		messages = [ "msg1", "msg2" ]
 
-deny[res] {
+		deny[res] {
 
-	msg := messages[_]
+			msg := messages[_]
 
-	res := {
-		"msg": msg,
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-	}
-}`,
+			res := {
+				"msg": msg,
+				"id": __rego_metadata__.id,
+				"title": __rego_metadata__.title,
+				"severity": __rego_metadata__.severity,
+				"type": __rego_metadata__.type,
+			}
+		}`,
 			},
 			results: []Result{
 				{
@@ -659,33 +440,33 @@ deny[res] {
 				"policy.uses_image_tag_latest.kinds": "Workload",
 				"policy.uses_image_tag_latest.rego": `package test
 
-__rego_metadata__ := {
-	"id": "KSV013",
-	"avd_id": "AVD-KSV-0013",
-	"title": "Image tag ':latest' used",
-	"short_code": "use-specific-tags",
-	"version": "v1.0.0",
-	"severity": "LOW",
-	"type": "Kubernetes Security Check",
-	"description": "It is best to avoid using the ':latest' image tag when deploying containers in production. Doing so makes it hard to track which version of the image is running, and hard to roll back the version.",
-	"recommended_actions": "Use a specific container image tag that is not 'latest'.",
-	"url": "https://kubernetes.io/docs/concepts/configuration/overview/#container-images",
-}
+		__rego_metadata__ := {
+			"id": "KSV013",
+			"avd_id": "AVD-KSV-0013",
+			"title": "Image tag ':latest' used",
+			"short_code": "use-specific-tags",
+			"version": "v1.0.0",
+			"severity": "LOW",
+			"type": "Kubernetes Security Check",
+			"description": "It is best to avoid using the ':latest' image tag when deploying containers in production. Doing so makes it hard to track which version of the image is running, and hard to roll back the version.",
+			"recommended_actions": "Use a specific container image tag that is not 'latest'.",
+			"url": "https://kubernetes.io/docs/concepts/configuration/overview/#container-images",
+		}
 
-messages = [ "msg1", "msg2" ]
+		messages = [ "msg1", "msg2" ]
 
-deny[res] {
+		deny[res] {
 
-	msg := messages[_]
+			msg := messages[_]
 
-	res := {
-		"msg": msg,
-		"id": __rego_metadata__.id,
-		"title": __rego_metadata__.title,
-		"severity": __rego_metadata__.severity,
-		"type": __rego_metadata__.type,
-	}
-}`,
+			res := {
+				"msg": msg,
+				"id": __rego_metadata__.id,
+				"title": __rego_metadata__.title,
+				"severity": __rego_metadata__.severity,
+				"type": __rego_metadata__.type,
+			}
+		}`,
 			},
 			results: []Result{
 				{
@@ -716,7 +497,7 @@ deny[res] {
 				},
 			},
 			useBuiltInPolicies: true,
-			policies:           map[string]string{},
+			policies:           make(map[string]string),
 			results:            getBuildInResults(t, "./testdata/fixture/builtin_role_result.json"),
 		},
 		{
@@ -734,7 +515,7 @@ deny[res] {
 				},
 			},
 			useBuiltInPolicies: false,
-			policies:           map[string]string{},
+			policies:           make(map[string]string),
 			expectedError:      policy.PoliciesNotFoundError,
 		},
 	}
@@ -743,12 +524,12 @@ deny[res] {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewGomegaWithT(t)
 			log := ctrl.Log.WithName("resourcecontroller")
-			checks, err := policy.NewPolicies(tc.policies, newTestConfig(tc.useBuiltInPolicies), log).Eval(context.TODO(), tc.resource)
+			checks, err := policy.NewPolicies(tc.policies, newTestConfig(tc.useBuiltInPolicies), log, &TestLoader{}, "1.27.1").Eval(context.TODO(), tc.resource)
 			if tc.expectedError != "" {
-				g.Expect(err).To(MatchError(tc.expectedError))
+				g.Expect(err).To(HaveOccurred())
 			} else {
 				g.Expect(err).ToNot(HaveOccurred())
-				g.Expect(getPolicyResults(checks)).To(Equal(tc.results))
+				g.Expect(reflect.DeepEqual(getPolicyResults(checks), tc.results))
 			}
 		})
 	}
@@ -757,7 +538,7 @@ deny[res] {
 func TestNewMetadata(t *testing.T) {
 	testCases := []struct {
 		name             string
-		values           map[string]interface{}
+		values           map[string]any
 		expectedMetadata Metadata
 		expectedError    string
 	}{
@@ -768,7 +549,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when severity key is not set",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"id":          "some id",
 				"title":       "some title",
 				"type":        "some type",
@@ -778,7 +559,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when severity value is nil",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    nil,
 				"id":          "some id",
 				"title":       "some title",
@@ -789,7 +570,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when severity value is blank",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "",
 				"id":          "some id",
 				"title":       "some title",
@@ -800,7 +581,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when severity value is invalid",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "INVALID",
 				"id":          "some id",
 				"title":       "some title",
@@ -811,7 +592,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when id key is not set",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"title":       "some title",
 				"type":        "some type",
@@ -821,7 +602,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when id value is nil",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          nil,
 				"title":       "some title",
@@ -832,7 +613,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when id value is blank",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "",
 				"title":       "some title",
@@ -843,7 +624,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when id value is not string",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          3,
 				"title":       "some title",
@@ -854,7 +635,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when title key is not set",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"type":        "some type",
@@ -864,7 +645,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when title value is nil",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity": "CRITICAL",
 				"id":       "KVH012",
 				"title":    nil,
@@ -873,7 +654,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when title value is blank",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"title":       "",
@@ -884,7 +665,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when type key is not set",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"title":       "some title",
@@ -894,7 +675,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when type value is nil",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"title":       "some title",
@@ -905,7 +686,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when type value is blank",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"title":       "some title",
@@ -916,7 +697,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return error when description key is not set",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity": "CRITICAL",
 				"id":       "some id",
 				"title":    "some title",
@@ -926,7 +707,7 @@ func TestNewMetadata(t *testing.T) {
 		},
 		{
 			name: "Should return metadata",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"severity":    "CRITICAL",
 				"id":          "some id",
 				"title":       "some title",
@@ -960,7 +741,7 @@ func TestNewMetadata(t *testing.T) {
 func TestNewMessage(t *testing.T) {
 	testCases := []struct {
 		name           string
-		values         map[string]interface{}
+		values         map[string]any
 		expectedResult string
 		expectedError  string
 	}{
@@ -971,26 +752,26 @@ func TestNewMessage(t *testing.T) {
 		},
 		{
 			name:          "Should return error when msg key is not set",
-			values:        map[string]interface{}{},
+			values:        make(map[string]any),
 			expectedError: "required key not found: msg",
 		},
 		{
 			name: "Should return error when msg value is nil",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"msg": nil,
 			},
 			expectedError: "required value is nil for key: msg",
 		},
 		{
 			name: "Should return error when msg value is blank",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"msg": "",
 			},
 			expectedError: "required value is blank for key: msg",
 		},
 		{
 			name: "Should return result",
-			values: map[string]interface{}{
+			values: map[string]any{
 				"msg": "some message",
 			},
 			expectedResult: "some message",
@@ -1038,7 +819,7 @@ func getPolicyResults(results scan.Results) Results {
 	prs := make(Results, 0)
 	for _, result := range results {
 		var msgs []string
-		if len(result.Description()) > 0 {
+		if result.Description() != "" {
 			msgs = []string{result.Description()}
 		} else {
 			msgs = nil
@@ -1069,7 +850,7 @@ func getBuildInResults(t *testing.T, filePath string) Results {
 }
 
 // NewMetadata constructs new Metadata based on raw values.
-func NewMetadata(values map[string]interface{}) (Metadata, error) {
+func NewMetadata(values map[string]any) (Metadata, error) {
 	if values == nil {
 		return Metadata{}, errors.New("values must not be nil")
 	}
@@ -1117,7 +898,7 @@ type Metadata struct {
 }
 
 // NewMessage constructs new message string based on raw values.
-func NewMessage(values map[string]interface{}) (string, error) {
+func NewMessage(values map[string]any) (string, error) {
 	if values == nil {
 		return "", errors.New("values must not be nil")
 	}
@@ -1127,7 +908,7 @@ func NewMessage(values map[string]interface{}) (string, error) {
 	}
 	return message, nil
 }
-func requiredStringValue(values map[string]interface{}, key string) (string, error) {
+func requiredStringValue(values map[string]any, key string) (string, error) {
 	value, ok := values[key]
 	if !ok {
 		return "", fmt.Errorf("required key not found: %s", key)
@@ -1152,7 +933,8 @@ func (a resultSort) Less(i, j int) bool { return a[i].Metadata.ID < a[j].Metadat
 func (a resultSort) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
 type testConfig struct {
-	builtInPolicies bool
+	builtInPolicies  bool
+	embeddedPolicies bool
 }
 
 func newTestConfig(builtInPolicies bool) testConfig {
@@ -1164,6 +946,11 @@ func (tc testConfig) GetUseBuiltinRegoPolicies() bool {
 	return tc.builtInPolicies
 }
 
+// GetUseBuiltinRegoPolicies return trivy config which associated to configauditreport plugin
+func (tc testConfig) GetUseEmbeddedRegoPolicies() bool {
+	return tc.embeddedPolicies
+}
+
 // GetSupportedConfigAuditKinds list of supported kinds to be scanned by the config audit scanner
 func (tc testConfig) GetSupportedConfigAuditKinds() []string {
 	return utils.MapKinds(strings.Split(trivy.SupportedConfigAuditKinds, ","))
@@ -1171,4 +958,15 @@ func (tc testConfig) GetSupportedConfigAuditKinds() []string {
 
 func (tc testConfig) GetSeverity() string {
 	return trivy.KeyTrivySeverity
+}
+
+type TestLoader struct {
+}
+
+func (tl *TestLoader) GetPoliciesAndBundlePath() ([]string, []string, error) {
+	policies, err := policy.LoadPoliciesData([]string{"./testdata/fixture/content"})
+	if err != nil {
+		return nil, nil, err
+	}
+	return policies, nil, nil
 }

@@ -5,23 +5,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aquasecurity/defsec/pkg/severity"
+	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
-	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
-
 	"github.com/go-logr/logr"
 	"github.com/liamg/memoryfs"
-
-	"github.com/aquasecurity/defsec/pkg/scan"
-	"github.com/aquasecurity/defsec/pkg/scanners/kubernetes"
-	"github.com/aquasecurity/defsec/pkg/scanners/options"
-
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
+	"github.com/aquasecurity/trivy/pkg/iac/rego"
+	"github.com/aquasecurity/trivy/pkg/iac/scan"
+	"github.com/aquasecurity/trivy/pkg/iac/scanners/kubernetes"
+	"github.com/aquasecurity/trivy/pkg/iac/scanners/options"
+	"github.com/aquasecurity/trivy/pkg/iac/severity"
+	"github.com/aquasecurity/trivy/pkg/mapfs"
 )
 
 const (
@@ -30,7 +31,7 @@ const (
 	keySuffixKinds   = ".kinds"
 	keySuffixRego    = ".rego"
 
-	PoliciesNotFoundError = "no policies found"
+	PoliciesNotFoundError = "failed to load rego policies from [externalPolicies]: stat externalPolicies: file does not exist"
 )
 
 const (
@@ -44,16 +45,20 @@ const (
 )
 
 type Policies struct {
-	data map[string]string
-	log  logr.Logger
-	cac  configauditreport.ConfigAuditConfig
+	data           map[string]string
+	log            logr.Logger
+	cac            configauditreport.ConfigAuditConfig
+	clusterVersion string
+	policyLoader   Loader
 }
 
-func NewPolicies(data map[string]string, cac configauditreport.ConfigAuditConfig, log logr.Logger) *Policies {
+func NewPolicies(data map[string]string, cac configauditreport.ConfigAuditConfig, log logr.Logger, pl Loader, serverVersion string) *Policies {
 	return &Policies{
-		data: data,
-		log:  log,
-		cac:  cac,
+		data:           data,
+		log:            log,
+		cac:            cac,
+		policyLoader:   pl,
+		clusterVersion: serverVersion,
 	}
 }
 
@@ -105,11 +110,11 @@ func (p *Policies) PoliciesByKind(kind string) (map[string]string, error) {
 }
 
 func (p *Policies) Hash(kind string) (string, error) {
-	modules, err := p.ModulesByKind(kind)
+	policies, err := p.loadPolicies(kind)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to load built-in / external policies: %s: %w", kind, err)
 	}
-	return kube.ComputeHash(modules), nil
+	return kube.ComputeHash(policies), nil
 }
 
 func (p *Policies) ModulesByKind(kind string) (map[string]string, error) {
@@ -122,16 +127,28 @@ func (p *Policies) ModulesByKind(kind string) (map[string]string, error) {
 	}
 	return modules, nil
 }
-func (p *Policies) ModulePolicyByKind(kind string) ([]string, error) {
+func (p *Policies) loadPolicies(kind string) ([]string, error) {
+	// read external policies
 	modByKind, err := p.ModulesByKind(kind)
 	if err != nil {
 		return nil, err
 	}
-	policy := make([]string, 0, len(modByKind))
+	externalPolicies := make([]string, 0, len(modByKind))
 	for _, mod := range modByKind {
-		policy = append(policy, mod)
+		externalPolicies = append(externalPolicies, mod)
 	}
-	return policy, nil
+	policies := make([]string, 0)
+	// read built-in policies
+	if p.cac.GetUseBuiltinRegoPolicies() {
+		policies, _, err = p.policyLoader.GetPoliciesAndBundlePath()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(externalPolicies) > 0 {
+		policies = append(policies, externalPolicies...)
+	}
+	return policies, nil
 }
 
 // Applicable check if policies exist either built in or via policies configmap
@@ -140,7 +157,7 @@ func (p *Policies) Applicable(resourceKind string) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	if !HasExternalPolicies && !p.cac.GetUseBuiltinRegoPolicies() {
+	if !HasExternalPolicies && !p.cac.GetUseBuiltinRegoPolicies() && !p.cac.GetUseEmbeddedRegoPolicies() {
 		return false, fmt.Sprintf("no policies found for kind %s", resourceKind), nil
 	}
 	return true, "", nil
@@ -177,56 +194,64 @@ func (p *Policies) rbacDisabled(rbacEnable bool, kind string) bool {
 
 // Eval evaluates Rego policies with Kubernetes resource client.Object as input.
 func (p *Policies) Eval(ctx context.Context, resource client.Object, inputs ...[]byte) (scan.Results, error) {
-	if resource == nil {
-		return nil, fmt.Errorf("resource must not be nil")
-	}
 	resourceKind := resource.GetObjectKind().GroupVersionKind().Kind
-	if resourceKind == "" {
-		return nil, fmt.Errorf("resource kind must not be blank")
-	}
-	externalPolicies, err := p.ModulePolicyByKind(resourceKind)
+	policies, err := p.loadPolicies(resourceKind)
 	if err != nil {
 		return nil, fmt.Errorf("failed listing externalPolicies by kind: %s: %w", resourceKind, err)
 	}
+
 	memfs := memoryfs.New()
-	hasExternalPolicies := len(externalPolicies) > 0
-	if !hasExternalPolicies && !p.cac.GetUseBuiltinRegoPolicies() {
-		return scan.Results{}, fmt.Errorf(PoliciesNotFoundError)
-	}
-	if hasExternalPolicies {
-		// add externalPolicies files
-		err = createPolicyInputFS(memfs, policiesFolder, externalPolicies, regoExt)
+	hasPolicies := len(policies) > 0
+	if hasPolicies {
+		// add add policies to in-memory filesystem
+		err = createPolicyInputFS(memfs, policiesFolder, policies, regoExt)
 		if err != nil {
 			return nil, err
 		}
 	}
-	var inputResource []byte
+	inputResource, err := resourceBytes(resource, inputs)
 	if err != nil {
 		return nil, err
 	}
-	if len(inputs) > 0 {
-		inputResource = inputs[0]
-	} else {
-		inputResource, err = json.Marshal(resource)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// add input files
+	// add resource input to in-memory filesystem
 	err = createPolicyInputFS(memfs, inputFolder, []string{string(inputResource)}, yamlExt)
 	if err != nil {
 		return nil, err
 	}
-	scanner := kubernetes.NewScanner(getScannerOptions(hasExternalPolicies, p.cac.GetUseBuiltinRegoPolicies(), policiesFolder)...)
+
+	dataFS, dataPaths, err := createDataFS([]string{}, p.clusterVersion)
+	if err != nil {
+		return nil, err
+	}
+	so := p.scannerOptions(policiesFolder, dataPaths, dataFS, hasPolicies)
+	scanner := kubernetes.NewScanner(so...)
 	scanResult, err := scanner.ScanFS(ctx, memfs, inputFolder)
 	if err != nil {
 		return nil, err
 	}
 	// special case when lib return nil for both checks and error
-	if scanResult == nil && err == nil {
-		return nil, fmt.Errorf("failed to run policy checks on resources")
+	if scanResult == nil {
+		return nil, errors.New("failed to run policy checks on resources")
 	}
 	return scanResult, nil
+}
+
+func resourceBytes(resource client.Object, inputs [][]byte) ([]byte, error) {
+	var inputResource []byte
+	var err error
+	if len(inputs) > 0 {
+		inputResource = inputs[0]
+	} else {
+		if jsonManifest, ok := resource.GetAnnotations()["kubectl.kubernetes.io/last-applied-configuration"]; ok {
+			inputResource = []byte(jsonManifest) // required for outdated-api when k8s convert resources
+		} else {
+			inputResource, err = json.Marshal(resource)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return inputResource, nil
 }
 
 // GetResultID return the result id found in aliases (legacy) otherwise use AvdID
@@ -246,11 +271,15 @@ func (r *Policies) HasSeverity(resultSeverity severity.Severity) bool {
 	return strings.Contains(defaultSeverity, string(resultSeverity))
 }
 
-func getScannerOptions(hasExternalPolicies bool, useDefaultPolicies bool, policiesFolder string) []options.ScannerOption {
-	optionsArray := []options.ScannerOption{options.ScannerWithEmbeddedPolicies(useDefaultPolicies)}
-	if hasExternalPolicies {
-		optionsArray = append(optionsArray, options.ScannerWithPolicyDirs(policiesFolder))
-		optionsArray = append(optionsArray, options.ScannerWithPolicyNamespaces(externalPoliciesNamespace))
+func (p *Policies) scannerOptions(policiesFolder string, dataPaths []string, dataFS fs.FS, hasPolicies bool) []options.ScannerOption {
+	optionsArray := []options.ScannerOption{
+		rego.WithDataFilesystem(dataFS),
+		rego.WithDataDirs(dataPaths...),
+	}
+	if !hasPolicies && p.cac.GetUseEmbeddedRegoPolicies() {
+		optionsArray = append(optionsArray, rego.WithEmbeddedPolicies(true), rego.WithEmbeddedLibraries(true))
+	} else {
+		optionsArray = append(optionsArray, rego.WithPolicyDirs(policiesFolder))
 	}
 	return optionsArray
 }
@@ -268,4 +297,29 @@ func createPolicyInputFS(memfs *memoryfs.FS, folderName string, fileData []strin
 		}
 	}
 	return nil
+}
+
+func createDataFS(dataPaths []string, k8sVersion string) (fs.FS, []string, error) {
+	fsys := mapfs.New()
+
+	// Create a virtual file for Kubernetes scanning
+	if k8sVersion != "" {
+		if err := fsys.MkdirAll("system", 0700); err != nil {
+			return nil, nil, err
+		}
+		data := []byte(fmt.Sprintf(`{"k8s": {"version": %q}}`, k8sVersion))
+		if err := fsys.WriteVirtualFile("system/k8s-version.json", data, 0600); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, path := range dataPaths {
+		if err := fsys.CopyFilesUnder(path); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// data paths are no longer needed as fs.FS contains only needed files now.
+	dataPaths = []string{"."}
+
+	return fsys, dataPaths, nil
 }

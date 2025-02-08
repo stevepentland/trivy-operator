@@ -1,6 +1,6 @@
 # ClusterComplianceReport
 
-The ClusterComplianceReport is a cluster-scoped resource, which represents the latest compliance control checks results.
+The ClusterComplianceReport is a cluster-scoped resource, which represents the latest compliance control check results.
 The report spec defines a mapping between pre-defined compliance control check ids to security scanners check ids.
 Currently, only `config-audit` security scanners are supported.
 
@@ -36,7 +36,7 @@ metadata:
     app.kubernetes.io/instance: trivy-operator
     app.kubernetes.io/managed-by: kubectl
     app.kubernetes.io/name: trivy-operator
-    app.kubernetes.io/version: 0.8.0
+    app.kubernetes.io/version: 0.24.0
   name: nsa
   resourceVersion: "69736"
   uid: d9991808-fb2f-4756-842f-8e9205e85b71
@@ -340,13 +340,13 @@ apiVersion: aquasecurity.github.io/v1alpha1
 kind: ClusterComplianceReport
 metadata:
   annotations:
-  creationTimestamp: "2022-12-04T18:25:27Z"
-  generation: 2
+    creationTimestamp: "2022-12-04T18:25:27Z"
+    generation: 2
   labels:
     app.kubernetes.io/instance: trivy-operator
     app.kubernetes.io/managed-by: kubectl
     app.kubernetes.io/name: trivy-operator
-    app.kubernetes.io/version: 0.8.0
+    app.kubernetes.io/version: 0.24.0
   name: nsa
   resourceVersion: "50896"
   uid: d9991808-fb2f-4756-842f-8e9205e85b71
@@ -1346,7 +1346,7 @@ status:
             "app.kubernetes.io/instance": "trivy-operator",
             "app.kubernetes.io/managed-by": "kubectl",
             "app.kubernetes.io/name": "trivy-operator",
-            "app.kubernetes.io/version": "0.13.2"
+            "app.kubernetes.io/version": "0.24.0"
         },
         "name": "cis",
         "resourceVersion": "8985",

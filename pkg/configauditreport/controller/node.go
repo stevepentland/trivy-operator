@@ -1,20 +1,9 @@
 package controller
 
 import (
-	j "github.com/aquasecurity/trivy-kubernetes/pkg/jobs"
-	"github.com/aquasecurity/trivy-kubernetes/pkg/k8s"
-	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
-	"github.com/aquasecurity/trivy-operator/pkg/infraassessment"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/jobs"
-	. "github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
-
 	"context"
 	"fmt"
-
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"time"
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
@@ -23,22 +12,39 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	tchecks "github.com/aquasecurity/trivy-checks"
+	j "github.com/aquasecurity/trivy-kubernetes/pkg/jobs"
+	"github.com/aquasecurity/trivy-kubernetes/pkg/k8s"
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
+	"github.com/aquasecurity/trivy-operator/pkg/infraassessment"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/jobs"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
+	"github.com/aquasecurity/trivy-operator/pkg/plugins/trivy"
+	"github.com/aquasecurity/trivy-operator/pkg/policy"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 //	NodeReconciler reconciles corev1.Node and corev1.Job objects
 //
 // to collect cluster nodes information (fileSystem permission and process arguments)
-// the node information will be evaluated by the complaince control checks per relevant reports, examples: cis-benchmark and nsa
+// the node information will be evaluated by the compliance control checks per relevant reports, examples: cis-benchmark and nsa
 type NodeReconciler struct {
 	logr.Logger
 	etc.Config
+	PolicyLoader policy.Loader
 	trivyoperator.ConfigData
 	kube.ObjectResolver
 	trivyoperator.PluginContext
 	configauditreport.PluginInMemory
 	jobs.LimitChecker
-	InfraReadWriter infraassessment.ReadWriter
+	InfraReadWriter  infraassessment.ReadWriter
+	CacheSyncTimeout time.Duration
 	trivyoperator.BuildInfo
 }
 
@@ -46,8 +52,15 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups=aquasecurity.github.io,resources=clusterinfraassessmentreports,verbs=get;list;watch;create;update;patch;delete
 
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Node{}, builder.WithPredicates(IsLinuxNode)).
+	excludeNodePredicate, err := predicate.ExcludeNode(r.ConfigData)
+	if err != nil {
+		return err
+	}
+
+	return ctrl.NewControllerManagedBy(mgr).WithOptions(controller.Options{
+		CacheSyncTimeout: r.CacheSyncTimeout,
+	}).
+		For(&corev1.Node{}, builder.WithPredicates(predicate.IsLinuxNode, predicate.Not(excludeNodePredicate))).
 		Owns(&v1alpha1.ClusterInfraAssessmentReport{}).
 		Complete(r.reconcileNodes())
 }
@@ -108,7 +121,11 @@ func (r *NodeReconciler) reconcileNodes() reconcile.Func {
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("preparing job: %w", err)
 		}
-		jobTolerations, err := r.GetScanJobTolerations()
+		jobAffinity, err := r.GetScanJobAffinity()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting job affinity: %w", err)
+		}
+		nodeTolerations, err := r.GetNodeCollectorTolerations()
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting job tolerations: %w", err)
 		}
@@ -128,19 +145,54 @@ func (r *NodeReconciler) reconcileNodes() reconcile.Func {
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting scan job [container] securityContext: %w", err)
 		}
+		scanJobAnnotations, err := r.GetScanJobAnnotations()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting scan job annotations: %w", err)
+		}
+		pConfig, err := r.PluginContext.GetConfig()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting getting config: %w", err)
+		}
+		tc := trivy.Config{PluginConfig: pConfig}
+
+		requirements, err := tc.GetResourceRequirements()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting node-collector resource requirements: %w", err)
+		}
+
+		scanJobPodPriorityClassName, err := r.GetScanJobPodPriorityClassName()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting scan job priority class name: %w", err)
+		}
+		_, bundlePath, err := r.PolicyLoader.GetPoliciesAndBundlePath()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting policies and bundle path: %w", err)
+		}
+
 		nodeCollectorImageRef := r.GetTrivyOperatorConfig().NodeCollectorImageRef()
+		useNodeSelector := r.GetTrivyOperatorConfig().UseNodeCollectorNodeSelector()
 		coll := j.NewCollector(cluster,
 			j.WithJobTemplateName(j.NodeCollectorName),
 			j.WithName(r.getNodeCollectorName(node)),
 			j.WithJobNamespace(on),
 			j.WithServiceAccount(r.ServiceAccount),
-			j.WithJobTolerations(jobTolerations),
+			j.WithCollectorTimeout(r.Config.ScanJobTimeout),
+			j.WithJobAffinity(jobAffinity),
+			j.WithJobTolerations(nodeTolerations),
 			j.WithPodSpecSecurityContext(scanJobSecurityContext),
 			j.WithContainerSecurityContext(scanJobContainerSecurityContext),
 			j.WithPodImagePullSecrets(r.GetNodeCollectorImagePullsecret()),
+			j.WithNodeConfig(true),
+			j.WithJobAnnotation(scanJobAnnotations),
 			j.WithImageRef(nodeCollectorImageRef),
 			j.WithVolumes(nodeCollectorVolumes),
+			j.WithUseNodeSelector(useNodeSelector),
+			j.WithCommandsPath(bundlePath),
+			j.WithEmbeddedCommandFileSystem(tchecks.EmbeddedK8sCommandsFileSystem),
+			j.WithEmbeddedNodeConfigFilesystem(tchecks.EmbeddedK8sCommandsFileSystem),
+			j.WithPodPriorityClassName(scanJobPodPriorityClassName),
 			j.WithVolumesMount(nodeCollectorVolumeMounts),
+			j.WithContainerResourceRequirements(requirements),
 			j.WithJobLabels(map[string]string{
 				trivyoperator.LabelNodeInfoCollector: "Trivy",
 				trivyoperator.LabelK8SAppManagedBy:   trivyoperator.AppTrivyOperator,

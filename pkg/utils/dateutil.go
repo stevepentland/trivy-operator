@@ -1,10 +1,12 @@
 package utils
 
 import (
-	"github.com/aquasecurity/trivy-operator/pkg/ext"
-	"github.com/gorhill/cronexpr"
-	"k8s.io/utils/pointer"
 	"time"
+
+	"github.com/gorhill/cronexpr"
+	"k8s.io/utils/ptr"
+
+	"github.com/aquasecurity/trivy-operator/pkg/ext"
 )
 
 // NextCronDuration check if next cron activation time has exceeded if so return true
@@ -36,7 +38,7 @@ func IsTTLExpired(ttl time.Duration, creationTime time.Time, clock ext.Clock) (b
 
 func DurationSecondsPtr(d time.Duration) *int64 {
 	if d > 0 {
-		return pointer.Int64(int64(d.Seconds()))
+		return ptr.To[int64](int64(d.Seconds()))
 	}
 	return nil
 }

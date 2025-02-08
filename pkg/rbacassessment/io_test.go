@@ -2,19 +2,19 @@ package rbacassessment_test
 
 import (
 	"context"
-	"k8s.io/api/batch/v1beta1"
 	"testing"
 
-	"github.com/aquasecurity/trivy-operator/pkg/rbacassessment"
-
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/api/batch/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/rbacassessment"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 func TestReadWriter(t *testing.T) {
@@ -26,6 +26,10 @@ func TestReadWriter(t *testing.T) {
 		resolver := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
 		readWriter := rbacassessment.NewReadWriter(&resolver)
 		err := readWriter.WriteReport(context.TODO(), v1alpha1.RbacAssessmentReport{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "RbacAssessmentReport",
+				APIVersion: "aquasecurity.github.io/v1alpha1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "role-app",
 				Namespace: "qa",
@@ -74,6 +78,10 @@ func TestReadWriter(t *testing.T) {
 
 	t.Run("Should update RbacAssessmentReport", func(t *testing.T) {
 		testClient := fake.NewClientBuilder().WithScheme(kubernetesScheme).WithObjects(&v1alpha1.RbacAssessmentReport{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "RbacAssessmentReport",
+				APIVersion: "aquasecurity.github.io/v1alpha1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            "role-app",
 				Namespace:       "qa",
@@ -95,6 +103,10 @@ func TestReadWriter(t *testing.T) {
 		resolver := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
 		readWriter := rbacassessment.NewReadWriter(&resolver)
 		err := readWriter.WriteReport(context.TODO(), v1alpha1.RbacAssessmentReport{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "RbacAssessmentReport",
+				APIVersion: "aquasecurity.github.io/v1alpha1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "role-app",
 				Namespace: "qa",
@@ -256,6 +268,10 @@ func TestReadWriter(t *testing.T) {
 		resolver := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
 		readWriter := rbacassessment.NewReadWriter(&resolver)
 		err := readWriter.WriteClusterReport(context.TODO(), v1alpha1.ClusterRbacAssessmentReport{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ClusterRbacAssessmentReport",
+				APIVersion: "aquasecurity.github.io/v1alpha1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "clusterrole-admin",
 				Labels: map[string]string{
@@ -303,6 +319,10 @@ func TestReadWriter(t *testing.T) {
 			WithScheme(kubernetesScheme).
 			WithObjects(
 				&v1alpha1.ClusterRbacAssessmentReport{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "ClusterRbacAssessmentReport",
+						APIVersion: "aquasecurity.github.io/v1alpha1",
+					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:            "clusterrole-admin",
 						ResourceVersion: "0",
@@ -323,6 +343,10 @@ func TestReadWriter(t *testing.T) {
 		resolver := kube.NewObjectResolver(testClient, &kube.CompatibleObjectMapper{})
 		readWriter := rbacassessment.NewReadWriter(&resolver)
 		err := readWriter.WriteClusterReport(context.TODO(), v1alpha1.ClusterRbacAssessmentReport{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ClusterRbacAssessmentReport",
+				APIVersion: "aquasecurity.github.io/v1alpha1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "clusterrole-admin",
 				Labels: map[string]string{

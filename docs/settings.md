@@ -1,6 +1,6 @@
 # Settings
 
-Trivy Operator read configuration settings from ConfigMaps, as well as Secrets that holds
+Trivy Operator reads configuration settings from ConfigMaps, as well as Secrets that hold
 confidential settings (such as a GitHub token). Trivy-Operator plugins read configuration and secret data from ConfigMaps
 and Secrets named after the plugin. For example, Trivy configuration is stored in the ConfigMap and Secret named
 `trivy-operator-trivy-config`.
@@ -13,6 +13,7 @@ ConfigMap:
 ```
 TRIVY_OPERATOR_NAMESPACE=<your trivy operator namespace>
 ```
+
 ```
 kubectl patch cm trivy-operator-trivy-config -n $TRIVY_OPERATOR_NAMESPACE \
   --type merge \
@@ -32,6 +33,7 @@ To set the GitHub token used by Trivy add the `trivy.githubToken` value to the `
 TRIVY_OPERATOR_NAMESPACE=<your trivy opersator namespace>
 GITHUB_TOKEN=<your token>
 ```
+
 ```
 kubectl patch secret trivy-operator-trivy-config -n $TRIVY_OPERATOR_NAMESPACE \
   --type merge \
@@ -53,6 +55,7 @@ configuration settings for common use cases. For example, switch Trivy from [Sta
 | `vulnerabilityReports.scanner`                                       | `Trivy`                               | The name of the plugin that generates vulnerability reports. Either `Trivy` or `Aqua`.                                                                                                                                              |
 | `vulnerabilityReports.scanJobsInSameNamespace`                       | `"false"`                             | Whether to run vulnerability scan jobs in same namespace of workload. Set `"true"` to enable.                                                                                                                                       |
 | `configAuditReports.scanner`                                         | `Trivy`                               | The name of the plugin that generates config audit reports.                                                                                                                                                                         |
+| `scanJob.affinity`                                                   | N/A                                   | JSON representation of the [affinity] to be applied to the scanner pods and node-collector. Example: `'{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/os","operator":"In","values":["linux"]}]},{"matchExpressions":[{"key":"virtual-kubelet.io/provider","operator":"DoesNotExist"}]}]}}}'`           |
 | `scanJob.tolerations`                                                | N/A                                   | JSON representation of the [tolerations] to be applied to the scanner pods and node-collector so that they can run on nodes with matching taints. Example: `'[{"key":"key1", "operator":"Equal", "value":"value1", "effect":"NoSchedule"}]'`           |
 | `nodeCollector.volumeMounts`| see helm/values.yaml | node-collector pod volumeMounts definition for collecting config files information
 | `nodeCollector.volumes`| see helm/values.yaml | node-collector pod volumes definition for collecting config files information
@@ -66,6 +69,7 @@ configuration settings for common use cases. For example, switch Trivy from [Sta
 | `compliance.reportType`               | `summary`                   | this flag control the type of report generated summary or all                |
 | `compliance.cron`                     | `0 */6 * * *`                   | this flag control the cron interval for compliance report generation                |
 | `scanJob.compressLogs`                                         | `"true"`                              | Control whether scanjob output should be compressed                                                                                                                                     |
+| `nodeCollector.excludeNodes`                        | `""`                      | excludeNodes comma-separated node labels that the node-collector job should exclude from scanning (example kubernetes.io/arch=arm64,team=dev)                                                                                                                                                                                                                                      |
 
 !!! tip
     You can delete a configuration key.For example, the following `kubectl patch` command deletes the `trivy.httpProxy` key:
@@ -78,5 +82,6 @@ configuration settings for common use cases. For example, switch Trivy from [Sta
       -p '[{"op": "remove", "path": "/data/trivy.httpProxy"}]'
     ```
 
+[Standalone]: ./docs/vulnerability-scanning/trivy.md#standalone
 [ClientServer]: ./docs/vulnerability-scanning/trivy.md#clientserver
 [tolerations]: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration

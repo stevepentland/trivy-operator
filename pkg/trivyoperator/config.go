@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 	containerimage "github.com/google/go-containerregistry/pkg/name"
+	ocpappsv1 "github.com/openshift/api/apps/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
@@ -22,6 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 )
 
 func NewScheme() *runtime.Scheme {
@@ -35,6 +37,7 @@ func NewScheme() *runtime.Scheme {
 	_ = v1alpha1.AddToScheme(scheme)
 	_ = coordinationv1.AddToScheme(scheme)
 	_ = apiextensionsv1.AddToScheme(scheme)
+	_ = ocpappsv1.Install(scheme)
 	return scheme
 }
 
@@ -53,20 +56,30 @@ type Scanner string
 const (
 	KeyVulnerabilityScannerEnabled       = "vulnerabilityScannerEnabled"
 	KeyExposedSecretsScannerEnabled      = "exposedSecretsScannerEnabled"
+	KeyGenerateSbom                      = "generateSbomEnabled"
 	keyVulnerabilityReportsScanner       = "vulnerabilityReports.scanner"
 	KeyVulnerabilityScansInSameNamespace = "vulnerabilityReports.scanJobsInSameNamespace"
 	keyConfigAuditReportsScanner         = "configAuditReports.scanner"
+	keyScanJobAffinity                   = "scanJob.affinity"
 	keyScanJobTolerations                = "scanJob.tolerations"
+	keyNodeCollectorTolerations          = "nodeCollector.tolerations"
 	KeyScanJobcompressLogs               = "scanJob.compressLogs"
 	KeyNodeCollectorVolumes              = "nodeCollector.volumes"
+	KeyNodeCollectorExcludeNodes         = "nodeCollector.excludeNodes"
 	KeyNodeCollectorVolumeMounts         = "nodeCollector.volumeMounts"
-	keyScanJobNodeSelector               = "scanJob.nodeSelector"
-	keyScanJobAnnotations                = "scanJob.annotations"
+	KeyScanJobCustomVolumesMount         = "scanJob.customVolumesMount"
+	KeyScanJobCustomVolumes              = "scanJob.customVolumes"
+	KeyScanJobUseGCRServiceAccount       = "scanJob.useGCRServiceAccount"
+
+	keyScanJobNodeSelector = "scanJob.nodeSelector"
+	keyScanJobAnnotations  = "scanJob.annotations"
 	//nolint
 	keyscanJobAutomountServiceAccountToken = "scanJob.automountServiceAccountToken"
+	keySkipInitContainers                  = "scanJob.skipInitContainers"
 	KeyScanJobContainerSecurityContext     = "scanJob.podTemplateContainerSecurityContext"
 	keyScanJobPodSecurityContext           = "scanJob.podTemplatePodSecurityContext"
 	keyScanJobPodTemplateLabels            = "scanJob.podTemplateLabels"
+	keyScanJobExcludeImags                 = "scanJob.excludeImages"
 	KeyScanJobPodPriorityClassName         = "scanJob.podPriorityClassName"
 	keyComplianceFailEntriesLimit          = "compliance.failEntriesLimit"
 	keySkipResourceByLabels                = "skipResourceByLabels"
@@ -75,8 +88,18 @@ const (
 	KeyMetricsResourceLabelsPrefix         = "metrics.resourceLabelsPrefix"
 	KeyTrivyServerURL                      = "trivy.serverURL"
 	KeyNodeCollectorImageRef               = "node.collector.imageRef"
+	KeyPoliciesBundleOciRef                = "policies.bundle.oci.ref"
+	KeyPoliciesBundleInsecure              = "policies.bundle.insecure"
+	KeyPoliciesBundleOciUser               = "policies.bundle.oci.user"
+	KeyPoliciesBundleOciPassword           = "policies.bundle.oci.password"
 	KeyNodeCollectorImagePullSecret        = "node.collector.imagePullSecret"
 	KeyAdditionalReportLabels              = "report.additionalLabels"
+	KeyNodeCollectorNodeSelector           = "node.collector.nodeSelector"
+)
+
+const (
+	TrueString  = "true"
+	FalseString = "false"
 )
 
 // ConfigData holds Trivy-operator configuration settings as a set of key-value
@@ -98,7 +121,8 @@ func GetDefaultConfig() ConfigData {
 		KeyScanJobcompressLogs:          "true",
 		keyComplianceFailEntriesLimit:   "10",
 		KeyReportRecordFailedChecksOnly: "true",
-		KeyNodeCollectorImageRef:        "ghcr.io/aquasecurity/node-collector:0.0.6",
+		KeyNodeCollectorImageRef:        "ghcr.io/aquasecurity/node-collector:0.2.1",
+		KeyPoliciesBundleOciRef:         "mirror.gcr.io/aquasec/trivy-checks:0",
 	}
 }
 
@@ -122,13 +146,18 @@ func (c ConfigData) ExposedSecretsScannerEnabled() bool {
 	return c.getBoolKey(KeyExposedSecretsScannerEnabled)
 }
 
+// GenerateSbomEnabled returns if the sbom generation is enabled
+func (c ConfigData) GenerateSbomEnabled() bool {
+	return c.getBoolKey(KeyGenerateSbom)
+}
+
 func (c ConfigData) getBoolKey(key string) bool {
 	var ok bool
 	var value string
 	if value, ok = c[key]; !ok {
 		return false
 	}
-	return value == "true"
+	return value == TrueString
 }
 
 func (c ConfigData) GetVulnerabilityReportsScanner() (Scanner, error) {
@@ -144,13 +173,27 @@ func (c ConfigData) VulnerabilityScanJobsInSameNamespace() bool {
 	return c.getBoolKey(KeyVulnerabilityScansInSameNamespace)
 }
 
-func (c ConfigData) GetConfigAuditReportsScanner() (Scanner, error) {
+func (c ConfigData) GetConfigAuditReportsScanner() Scanner {
 	var ok bool
 	var value string
 	if value, ok = c[keyConfigAuditReportsScanner]; !ok {
-		return "", fmt.Errorf("property %s not set", keyConfigAuditReportsScanner)
+		return Scanner("Trivy")
 	}
-	return Scanner(value), nil
+	return Scanner(value)
+}
+
+func (c ConfigData) GetScanJobAffinity() (*corev1.Affinity, error) {
+	if c[keyScanJobAffinity] == "" {
+		return nil, nil
+	}
+
+	scanJobAffinity := &corev1.Affinity{}
+	err := json.Unmarshal([]byte(c[keyScanJobAffinity]), scanJobAffinity)
+	if err != nil {
+		return nil, fmt.Errorf("failed parsing incorrectly formatted custom scan pod template affinity: %s", c[keyScanJobAffinity])
+	}
+
+	return scanJobAffinity, nil
 }
 
 func (c ConfigData) GetScanJobTolerations() ([]corev1.Toleration, error) {
@@ -163,6 +206,30 @@ func (c ConfigData) GetScanJobTolerations() ([]corev1.Toleration, error) {
 	return scanJobTolerations, err
 }
 
+func (c ConfigData) ExcludeImages() []string {
+	patterns := make([]string, 0)
+	if excludeImagesPattern, ok := c[keyScanJobExcludeImags]; ok {
+		for _, s := range strings.Split(excludeImagesPattern, ",") {
+			if strings.TrimSpace(s) == "" {
+				continue
+			}
+			patterns = append(patterns, strings.TrimSpace(s))
+		}
+		return patterns
+	}
+	return []string{}
+}
+
+func (c ConfigData) GetNodeCollectorTolerations() ([]corev1.Toleration, error) {
+	var nodeCollectorTolerations []corev1.Toleration
+	if c[keyNodeCollectorTolerations] == "" {
+		return nodeCollectorTolerations, nil
+	}
+	err := json.Unmarshal([]byte(c[keyNodeCollectorTolerations]), &nodeCollectorTolerations)
+
+	return nodeCollectorTolerations, err
+}
+
 func (c ConfigData) GetNodeCollectorImagePullsecret() []corev1.LocalObjectReference {
 	imagePullSecrets := make([]corev1.LocalObjectReference, 0)
 	imagePullSecretValue := c[KeyNodeCollectorImagePullSecret]
@@ -170,6 +237,14 @@ func (c ConfigData) GetNodeCollectorImagePullsecret() []corev1.LocalObjectRefere
 		imagePullSecrets = append(imagePullSecrets, corev1.LocalObjectReference{Name: imagePullSecretValue})
 	}
 	return imagePullSecrets
+}
+
+func (c ConfigData) UseNodeCollectorNodeSelector() bool {
+	val, ok := c[KeyNodeCollectorNodeSelector]
+	if !ok {
+		return true
+	}
+	return val == TrueString
 }
 
 func (c ConfigData) GetNodeCollectorVolumes() ([]corev1.Volume, error) {
@@ -189,6 +264,23 @@ func (c ConfigData) GetGetNodeCollectorVolumeMounts() ([]corev1.VolumeMount, err
 	return volumesMount, err
 }
 
+func (c ConfigData) GetScanJobCustomVolumes() ([]corev1.Volume, error) {
+	var volumes []corev1.Volume
+	if c[KeyScanJobCustomVolumes] == "" {
+		return volumes, nil
+	}
+	err := json.Unmarshal([]byte(c[KeyScanJobCustomVolumes]), &volumes)
+	return volumes, err
+}
+func (c ConfigData) GetScanJobCustomVolumeMounts() ([]corev1.VolumeMount, error) {
+	var volumesMount []corev1.VolumeMount
+	if c[KeyScanJobCustomVolumesMount] == "" {
+		return volumesMount, nil
+	}
+	err := json.Unmarshal([]byte(c[KeyScanJobCustomVolumesMount]), &volumesMount)
+	return volumesMount, err
+}
+
 func (c ConfigData) GetScanJobNodeSelector() (map[string]string, error) {
 	scanJobNodeSelector := make(map[string]string, 0)
 	if c[keyScanJobNodeSelector] == "" {
@@ -196,7 +288,7 @@ func (c ConfigData) GetScanJobNodeSelector() (map[string]string, error) {
 	}
 
 	if err := json.Unmarshal([]byte(c[keyScanJobNodeSelector]), &scanJobNodeSelector); err != nil {
-		return scanJobNodeSelector, fmt.Errorf("failed to parse incorrect job template nodeSelector %s: %w", c[keyScanJobNodeSelector], err)
+		return scanJobNodeSelector, fmt.Errorf("failed to parse incorrect pod template nodeSelector %s: %w", c[keyScanJobNodeSelector], err)
 	}
 
 	return scanJobNodeSelector, nil
@@ -234,17 +326,29 @@ func (c ConfigData) GetScanJobAutomountServiceAccountToken() bool {
 	return c.getBoolKey(keyscanJobAutomountServiceAccountToken)
 }
 
+func (c ConfigData) GetScanJobUseGCRServiceAccount() bool {
+	val, ok := c[KeyScanJobUseGCRServiceAccount]
+	if !ok {
+		return true
+	}
+	return val == TrueString
+}
+
+func (c ConfigData) GetSkipInitContainers() bool {
+	return c.getBoolKey(keySkipInitContainers)
+}
+
 func (c ConfigData) GetScanJobAnnotations() (map[string]string, error) {
 	scanJobAnnotationsStr, found := c[keyScanJobAnnotations]
 	if !found || strings.TrimSpace(scanJobAnnotationsStr) == "" {
-		return map[string]string{}, nil
+		return make(map[string]string), nil
 	}
 
-	scanJobAnnotationsMap := map[string]string{}
+	scanJobAnnotationsMap := make(map[string]string)
 	for _, annotation := range strings.Split(scanJobAnnotationsStr, ",") {
 		sepByEqual := strings.Split(annotation, "=")
 		if len(sepByEqual) != 2 {
-			return map[string]string{}, fmt.Errorf("failed parsing incorrectly formatted custom scan job annotations: %s", scanJobAnnotationsStr)
+			return make(map[string]string), fmt.Errorf("failed parsing incorrectly formatted custom scan job annotations: %s", scanJobAnnotationsStr)
 		}
 		key, value := sepByEqual[0], sepByEqual[1]
 		scanJobAnnotationsMap[key] = value
@@ -253,14 +357,33 @@ func (c ConfigData) GetScanJobAnnotations() (map[string]string, error) {
 	return scanJobAnnotationsMap, nil
 }
 
+func (c ConfigData) GetNodeCollectorExcludeNodes() (map[string]string, error) {
+	nodeCollectorExcludeNodesStr, found := c[KeyNodeCollectorExcludeNodes]
+	if !found || strings.TrimSpace(nodeCollectorExcludeNodesStr) == "" {
+		return make(map[string]string), nil
+	}
+
+	nodeCollectorExcludeNodesMap := make(map[string]string)
+	for _, excludeNode := range strings.Split(nodeCollectorExcludeNodesStr, ",") {
+		sepByEqual := strings.Split(excludeNode, "=")
+		if len(sepByEqual) != 2 {
+			return make(map[string]string), fmt.Errorf("failed parsing incorrectly formatted exclude nodes values: %s", nodeCollectorExcludeNodesStr)
+		}
+		key, value := sepByEqual[0], sepByEqual[1]
+		nodeCollectorExcludeNodesMap[key] = value
+	}
+	return nodeCollectorExcludeNodesMap, nil
+}
+
 func (c ConfigData) GetScanJobPodTemplateLabels() (labels.Set, error) {
 	scanJobPodTemplateLabelsStr, found := c[keyScanJobPodTemplateLabels]
 	if !found || strings.TrimSpace(scanJobPodTemplateLabelsStr) == "" {
 		return labels.Set{}, nil
 	}
 
-	scanJobPodTemplateLabelsMap := map[string]string{}
-	for _, annotation := range strings.Split(scanJobPodTemplateLabelsStr, ",") {
+	scanJobPodTemplateLabelsMap := make(map[string]string)
+	labelParts := strings.Split(strings.TrimSuffix(scanJobPodTemplateLabelsStr, ","), ",")
+	for _, annotation := range labelParts {
 		sepByEqual := strings.Split(annotation, "=")
 		if len(sepByEqual) != 2 {
 			return labels.Set{}, fmt.Errorf("failed parsing incorrectly formatted custom scan pod template labels: %s", scanJobPodTemplateLabelsStr)
@@ -287,7 +410,7 @@ func (c ConfigData) GetAdditionalReportLabels() (labels.Set, error) {
 		return labels.Set{}, nil
 	}
 
-	additionalReportLabelsMap := map[string]string{}
+	additionalReportLabelsMap := make(map[string]string)
 	for _, annotation := range strings.Split(additionalReportLabelsStr, ",") {
 		sepByEqual := strings.Split(annotation, "=")
 		if len(sepByEqual) != 2 {
@@ -330,6 +453,20 @@ func (c ConfigData) NodeCollectorImageRef() string {
 	return c[KeyNodeCollectorImageRef]
 }
 
+func (c ConfigData) PolicyBundleOciRef() string {
+	return c[KeyPoliciesBundleOciRef]
+}
+func (c ConfigData) PolicyBundleInsecure() bool {
+	return c.getBoolKey(KeyPoliciesBundleInsecure)
+}
+
+func (c ConfigData) PolicyBundleOciUser() string {
+	return c[KeyPoliciesBundleOciUser]
+}
+
+func (c ConfigData) PolicyBundleOciPassword() string {
+	return c[KeyPoliciesBundleOciPassword]
+}
 func (c ConfigData) GeTrivyServerURL() string {
 	return c[KeyTrivyServerURL]
 }

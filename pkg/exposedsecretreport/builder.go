@@ -3,18 +3,18 @@ package exposedsecretreport
 import (
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 type ReportBuilder struct {
@@ -23,7 +23,6 @@ type ReportBuilder struct {
 	container               string
 	hash                    string
 	data                    v1alpha1.ExposedSecretReportData
-	reportTTL               *time.Duration
 	resourceLabelsToInclude []string
 	additionalReportLabels  labels.Set
 }
@@ -51,11 +50,6 @@ func (b *ReportBuilder) PodSpecHash(hash string) *ReportBuilder {
 
 func (b *ReportBuilder) Data(data v1alpha1.ExposedSecretReportData) *ReportBuilder {
 	b.data = data
-	return b
-}
-
-func (b *ReportBuilder) ReportTTL(ttl *time.Duration) *ReportBuilder {
-	b.reportTTL = ttl
 	return b
 }
 
@@ -102,11 +96,6 @@ func (b *ReportBuilder) Get() (v1alpha1.ExposedSecretReport, error) {
 		},
 		Report: b.data,
 	}
-	if b.reportTTL != nil {
-		report.Annotations = map[string]string{
-			v1alpha1.TTLReportAnnotation: b.reportTTL.String(),
-		}
-	}
 	err := kube.ObjectToObjectMeta(b.controller, &report.ObjectMeta)
 	if err != nil {
 		return v1alpha1.ExposedSecretReport{}, err
@@ -123,6 +112,6 @@ func (b *ReportBuilder) Get() (v1alpha1.ExposedSecretReport, error) {
 	// additional RBAC permissions are not required when the OwnerReferencesPermissionsEnforcement
 	// is enabled.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement
-	report.OwnerReferences[0].BlockOwnerDeletion = pointer.Bool(false)
+	report.OwnerReferences[0].BlockOwnerDeletion = ptr.To[bool](false)
 	return report, nil
 }

@@ -1,11 +1,13 @@
 package etc_test
 
 import (
+	"net/http"
 	"testing"
 
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
 )
 
 func TestOperator_GetTargetNamespaces(t *testing.T) {
@@ -104,6 +106,35 @@ func TestOperator_ResolveInstallMode(t *testing.T) {
 	}
 }
 
+func TestOperator_GetWebhookBroadcastCustomHeaders(t *testing.T) {
+	testCases := []struct {
+		name                                  string
+		operator                              etc.Config
+		expectedWebhookBroadcastCustomHeaders http.Header
+	}{
+		{
+			name: "Should return single custom header",
+			operator: etc.Config{
+				WebhookBroadcastCustomHeaders: "x-api-key:trivy",
+			},
+			expectedWebhookBroadcastCustomHeaders: http.Header{"X-Api-Key": {"trivy"}},
+		},
+		{
+			name: "Should return multiple custom headers",
+			operator: etc.Config{
+				WebhookBroadcastCustomHeaders: "x-api-key:trivy,X-Api-User:trivy-operator,X-API-TOKEN:trivy-token",
+			},
+			expectedWebhookBroadcastCustomHeaders: http.Header{"X-Api-Key": {"trivy"}, "X-Api-User": {"trivy-operator"}, "X-Api-Token": {"trivy-token"}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedWebhookBroadcastCustomHeaders, tc.operator.GetWebhookBroadcastCustomHeaders())
+		})
+	}
+}
+
 func TestOperator_GetTargetWorkloads(t *testing.T) {
 	testCases := []struct {
 		name                    string
@@ -165,14 +196,14 @@ func TestOperator_GetPrivateRegistryScanSecretsNames(t *testing.T) {
 			operator: etc.Config{
 				PrivateRegistryScanSecretsNames: "{}",
 			},
-			expectedNameSpaceSecrets: map[string]string{},
+			expectedNameSpaceSecrets: make(map[string]string),
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			secrets, err := tc.operator.GetPrivateRegistryScanSecretsNames()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tc.expectedNameSpaceSecrets, secrets)
 		})
 	}

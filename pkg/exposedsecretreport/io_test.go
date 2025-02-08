@@ -4,15 +4,16 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/exposedsecretreport"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/exposedsecretreport"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 func TestNewReadWriter(t *testing.T) {
@@ -55,7 +56,7 @@ func TestNewReadWriter(t *testing.T) {
 		var list v1alpha1.ExposedSecretReportList
 		err = testClient.List(context.TODO(), &list)
 		require.NoError(t, err)
-		reports := map[string]v1alpha1.ExposedSecretReport{}
+		reports := make(map[string]v1alpha1.ExposedSecretReport)
 		for _, item := range list.Items {
 			reports[item.Name] = item
 		}
@@ -94,6 +95,10 @@ func TestNewReadWriter(t *testing.T) {
 	t.Run("Should update ExposedSecretReports", func(t *testing.T) {
 		testClient := fake.NewClientBuilder().WithScheme(kubernetesScheme).WithObjects(
 			&v1alpha1.ExposedSecretReport{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "aquasecurity.github.io/v1alpha1",
+					Kind:       "ExposedSecretReport",
+				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "deployment-app1-container1",
 					Namespace:       "qa",
@@ -108,6 +113,10 @@ func TestNewReadWriter(t *testing.T) {
 				},
 			},
 			&v1alpha1.ExposedSecretReport{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "aquasecurity.github.io/v1alpha1",
+					Kind:       "ExposedSecretReport",
+				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "deployment-app1-container2",
 					Namespace:       "qa",
@@ -125,6 +134,10 @@ func TestNewReadWriter(t *testing.T) {
 		readWriter := exposedsecretreport.NewReadWriter(&resolver)
 		err := readWriter.Write(context.TODO(), []v1alpha1.ExposedSecretReport{
 			{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "aquasecurity.github.io/v1alpha1",
+					Kind:       "ExposedSecretReport",
+				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "deployment-app1-container1",
 					Namespace: "qa",
@@ -249,7 +262,7 @@ func TestNewReadWriter(t *testing.T) {
 			Namespace: "my-namespace",
 		})
 		require.NoError(t, err)
-		reports := map[string]bool{}
+		reports := make(map[string]bool)
 		for _, item := range list {
 			reports[item.Name] = true
 		}

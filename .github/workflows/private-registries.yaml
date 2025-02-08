@@ -1,5 +1,5 @@
 ---
-name: Private Registries
+name: Private Registries E2E
 on:
   push:
     branches:
@@ -11,46 +11,49 @@ on:
       - mkdocs.yml
       - LICENSE
       - NOTICE
-
+  pull_request_target:
+    branches:
+      - main
+    paths-ignore:
+      - .github/ISSUE_TEMPLATE/*.md
+      - "*.md"
+      - docs/**
+      - mkdocs.yml
+      - LICENSE
+      - NOTICE
 env:
-  GO_VERSION: 1.20.3
   KIND_VERSION: v0.17.0
   KIND_IMAGE: kindest/node:v1.21.1@sha256:69860bda5563ac81e3c0057d654b5253219618a22ec3a346306239bba8cfa1a6
+  GO_VERSION: '1.23'
 permissions: {}
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  e2e-testing-private-registry:
-    name: Run end to end private registry testing
-    runs-on: ubuntu-latest
+  private-registry-testing:
+    name: private registry testing
+    runs-on: ubuntu-22.04
     env:
       DOCKER_CLI_EXPERIMENTAL: enabled
     steps:
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
       - name: Available platforms
         run: echo ${{ steps.buildx.outputs.platforms }}
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
       - name: Release snapshot
-        uses: goreleaser/goreleaser-action@v4
+        uses: goreleaser/goreleaser-action@v6
         with:
-          version: v1.7.0
-          args: release -f=goreleaser-e2e.yaml --snapshot --skip-publish --rm-dist
+          version: v2.4.8
+          args: release -f=goreleaser-e2e.yaml --snapshot --skip=publish --clean
       - name: Install kind and create cluster
         run: >
           curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION
@@ -80,10 +83,10 @@ jobs:
             -n private
       - name: Load operator image to cluster
         run: >
-          docker tag ghcr.io/aquasecurity/trivy-operator:${{ github.sha }}-amd64
-          ghcr.io/aquasecurity/trivy-operator:e2e
+          docker tag mirror.gcr.io/aquasec/trivy-operator:${{ github.sha }}-amd64
+          mirror.gcr.io/aquasec/trivy-operator:e2e
 
-          docker save -o trivy-operator.tar ghcr.io/aquasecurity/trivy-operator:e2e
+          docker save -o trivy-operator.tar mirror.gcr.io/aquasec/trivy-operator:e2e
 
           kind load image-archive trivy-operator.tar
       - name: Init E2E tests (Install kuttl & helm)
@@ -101,22 +104,14 @@ jobs:
           ./get_helm.sh
       - name: image private registries via pod image pull secret tests
         run: >
+          ./bin/kuttl test --start-kind=false --config tests/e2e/config/image-private-registries.yaml
 
-          ./bin/kuttl test --start-kind=false --config tests/config/image-private-registries.yaml
-
-          ./tests/resources-cleanup.sh > /dev/null 2>&1
+          ./tests/resources-cleanup-private.sh > /dev/null 2>&1
       - name: image private registries via service account image pull secret tests
         run: >
+          ./bin/kuttl test --start-kind=false --config tests/e2e/config/image-private-registries-sa.yaml
 
-          ./bin/kuttl test --start-kind=false --config tests/config/image-private-registries-sa.yaml
-
-          ./tests/resources-cleanup.sh > /dev/null 2>&1
-      - name: image private registries via namespace to secret config tests
-        run: >
-
-          ./bin/kuttl test --start-kind=false --config tests/config/image-private-registries-config.yaml
-
-          ./tests/resources-cleanup.sh > /dev/null 2>&1
+          ./tests/resources-cleanup-private.sh > /dev/null 2>&1
       - name: Delete kind cluster
         run: |
           kind delete cluster

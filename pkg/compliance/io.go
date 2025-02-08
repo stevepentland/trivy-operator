@@ -1,17 +1,19 @@
 package compliance
 
 import (
-	"github.com/aquasecurity/trivy/pkg/compliance/report"
-	ttypes "github.com/aquasecurity/trivy/pkg/types"
-
 	"context"
+	"errors"
 	"fmt"
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/ext"
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strings"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/ext"
+	"github.com/aquasecurity/trivy/pkg/compliance/report"
+	ttypes "github.com/aquasecurity/trivy/pkg/types"
 )
 
 type Mgr interface {
@@ -54,16 +56,16 @@ func (w *cm) createComplianceReport(ctx context.Context, reportSpec v1alpha1.Rep
 	reportStatus.UpdateTimestamp = metav1.NewTime(ext.NewSystemClock().Now())
 	r := v1alpha1.ClusterComplianceReport{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: strings.ToLower(reportSpec.Complaince.ID),
+			Name: strings.ToLower(reportSpec.Compliance.ID),
 		},
 		Status: reportStatus,
 	}
 	var existing v1alpha1.ClusterComplianceReport
 	err := w.client.Get(ctx, types.NamespacedName{
-		Name: strings.ToLower(reportSpec.Complaince.ID),
+		Name: strings.ToLower(reportSpec.Compliance.ID),
 	}, &existing)
 	if err != nil {
-		return nil, fmt.Errorf("compliance crd with name %s is missing", reportSpec.Complaince.ID)
+		return nil, fmt.Errorf("compliance crd with name %s is missing", reportSpec.Compliance.ID)
 	}
 	copied := existing.DeepCopy()
 	copied.Labels = r.Labels
@@ -75,7 +77,7 @@ func (w *cm) createComplianceReport(ctx context.Context, reportSpec v1alpha1.Rep
 
 // BuildComplianceReport build compliance based on report type {summary | detail}
 func (w *cm) buildComplianceReport(spec v1alpha1.ReportSpec, complianceResults []ttypes.Results) (v1alpha1.ReportStatus, error) {
-	trivyCompSpec := v1alpha1.ToComplainceSpec(spec.Complaince)
+	trivyCompSpec := v1alpha1.ToComplianceSpec(spec.Compliance)
 	cr, err := report.BuildComplianceReport(complianceResults, trivyCompSpec)
 	if err != nil {
 		return v1alpha1.ReportStatus{}, err
@@ -88,13 +90,14 @@ func (w *cm) buildComplianceReport(spec v1alpha1.ReportSpec, complianceResults [
 	case v1alpha1.ReportDetail:
 		return v1alpha1.ReportStatus{DetailReport: v1alpha1.FromDetailReport(cr), Summary: summary}, nil
 	default:
-		return v1alpha1.ReportStatus{}, fmt.Errorf("report type is invalid")
+		return v1alpha1.ReportStatus{}, errors.New("report type is invalid")
 	}
 }
 
 // MisconfigReportToTrivyResults convert misconfig and infra assessment report Data to trivy results
 func misconfigReportToTrivyResults(cli client.Client, ctx context.Context) ([]ttypes.Results, error) {
 	resultsArray := make([]ttypes.Results, 0)
+	// collect configaudit report data
 	caObjList := &v1alpha1.ConfigAuditReportList{}
 	err := cli.List(ctx, caObjList)
 	if err != nil {
@@ -104,6 +107,27 @@ func misconfigReportToTrivyResults(cli client.Client, ctx context.Context) ([]tt
 		results := reportsToResults(ca.Report.Checks, ca.Name, ca.Namespace)
 		resultsArray = append(resultsArray, results)
 	}
+	// collect rbac assessment report data
+	raObjList := &v1alpha1.RbacAssessmentReportList{}
+	err = cli.List(ctx, raObjList)
+	if err != nil {
+		return nil, err
+	}
+	for _, ra := range raObjList.Items {
+		results := reportsToResults(ra.Report.Checks, ra.Name, ra.Namespace)
+		resultsArray = append(resultsArray, results)
+	}
+	// collect cluster rbac assessment report data
+	craObjList := &v1alpha1.ClusterRbacAssessmentReportList{}
+	err = cli.List(ctx, craObjList)
+	if err != nil {
+		return nil, err
+	}
+	for _, cra := range craObjList.Items {
+		results := reportsToResults(cra.Report.Checks, cra.Name, cra.Namespace)
+		resultsArray = append(resultsArray, results)
+	}
+	// collect infra assessment report data
 	iaObjList := &v1alpha1.InfraAssessmentReportList{}
 	err = cli.List(ctx, iaObjList)
 	if err != nil {
@@ -113,6 +137,7 @@ func misconfigReportToTrivyResults(cli client.Client, ctx context.Context) ([]tt
 		results := reportsToResults(ia.Report.Checks, ia.Name, ia.Namespace)
 		resultsArray = append(resultsArray, results)
 	}
+	// collect cluster infra assessment report data
 	ciaObjList := &v1alpha1.ClusterInfraAssessmentReportList{}
 	err = cli.List(ctx, ciaObjList)
 	if err != nil {
@@ -125,20 +150,20 @@ func misconfigReportToTrivyResults(cli client.Client, ctx context.Context) ([]tt
 	return resultsArray, nil
 }
 
-func reportsToResults(checks []v1alpha1.Check, name string, namespace string) ttypes.Results {
+func reportsToResults(checks []v1alpha1.Check, name, namespace string) ttypes.Results {
 	results := ttypes.Results{}
 	for _, check := range checks {
-		status := ttypes.StatusFailure
+		status := ttypes.MisconfStatusFailure
 		if check.Success {
-			status = ttypes.StatusPassed
+			status = ttypes.MisconfStatusPassed
 		}
 		id := check.ID
 		if !strings.HasPrefix(check.ID, "AVD-") {
 			if strings.HasPrefix(check.ID, "KSV") {
-				id = fmt.Sprintf("%s-%s-%s", "AVD", "KSV", strings.Replace(check.ID, "KSV", "0", -1))
+				id = fmt.Sprintf("%s-%s-%s", "AVD", "KSV", strings.ReplaceAll(check.ID, "KSV", "0"))
 			}
 			if strings.HasPrefix(check.ID, "KCV") {
-				id = fmt.Sprintf("%s-%s-%s", "AVD", "KCV", strings.Replace(check.ID, "KCV", "", -1))
+				id = fmt.Sprintf("%s-%s-%s", "AVD", "KCV", strings.ReplaceAll(check.ID, "KCV", ""))
 			}
 		}
 		misconfigResult := ttypes.Result{Target: fmt.Sprintf("%s/%s", namespace, name),
@@ -147,6 +172,7 @@ func reportsToResults(checks []v1alpha1.Check, name string, namespace string) tt
 				Title:       check.Title,
 				Description: check.Description,
 				Message:     check.Description,
+				Resolution:  check.Remediation,
 				Severity:    string(check.Severity),
 				Status:      status,
 			},

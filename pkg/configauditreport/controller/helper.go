@@ -5,7 +5,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aquasecurity/defsec/pkg/scan"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
 	"github.com/aquasecurity/trivy-operator/pkg/ext"
@@ -14,14 +19,10 @@ import (
 	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
 	"github.com/aquasecurity/trivy-operator/pkg/policy"
 	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
-	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"github.com/aquasecurity/trivy/pkg/iac/scan"
 )
 
-func Policies(ctx context.Context, config etc.Config, c client.Client, cac configauditreport.ConfigAuditConfig, log logr.Logger) (*policy.Policies, error) {
+func Policies(ctx context.Context, config etc.Config, c client.Client, cac configauditreport.ConfigAuditConfig, log logr.Logger, pl policy.Loader, clusterVersion ...string) (*policy.Policies, error) {
 	cm := &corev1.ConfigMap{}
 
 	err := c.Get(ctx, client.ObjectKey{
@@ -33,7 +34,11 @@ func Policies(ctx context.Context, config etc.Config, c client.Client, cac confi
 			return nil, fmt.Errorf("failed getting policies from configmap: %s/%s: %w", config.Namespace, trivyoperator.PoliciesConfigMapName, err)
 		}
 	}
-	return policy.NewPolicies(cm.Data, cac, log), nil
+	var version string
+	if len(clusterVersion) > 0 {
+		version = clusterVersion[0]
+	}
+	return policy.NewPolicies(cm.Data, cac, log, pl, version), nil
 }
 
 func evaluate(ctx context.Context, policies *policy.Policies, resource client.Object, bi trivyoperator.BuildInfo, cd trivyoperator.ConfigData, c etc.Config, inputs ...[]byte) (Misconfiguration, error) {
@@ -42,8 +47,10 @@ func evaluate(ctx context.Context, policies *policy.Policies, resource client.Ob
 	if err != nil {
 		return Misconfiguration{}, err
 	}
+
 	infraChecks := make([]v1alpha1.Check, 0)
 	checks := make([]v1alpha1.Check, 0)
+
 	for _, result := range results {
 		if !policies.HasSeverity(result.Severity()) {
 			continue
@@ -55,16 +62,20 @@ func evaluate(ctx context.Context, policies *policy.Policies, resource client.Ob
 		if cd.ReportRecordFailedChecksOnly() && result.Status() == scan.StatusPassed {
 			continue
 		}
+		currentCheck := getCheck(result, id)
+		if len(currentCheck.Messages) == 0 || (len(currentCheck.Messages) == 1 && strings.TrimSpace(currentCheck.Messages[0]) == "") {
+			continue
+		}
 		if infraCheck(id) {
 			if strings.HasPrefix(id, "N/A") {
 				continue
 			}
 			if k8sCoreComponent(resource) {
-				infraChecks = append(infraChecks, getCheck(result, id))
+				infraChecks = append(infraChecks, currentCheck)
 			}
 			continue
 		}
-		checks = append(checks, getCheck(result, id))
+		checks = append(checks, currentCheck)
 	}
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
 	if kube.IsRoleTypes(kube.Kind(kind)) && !c.MergeRbacFindingWithConfigAudit {

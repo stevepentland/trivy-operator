@@ -4,15 +4,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/aquasecurity/trivy-operator/pkg/ext"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	"github.com/aquasecurity/trivy-operator/pkg/ext"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 // InstallModePredicate is a predicate.Predicate that determines whether to
@@ -46,17 +47,15 @@ var InstallModePredicate = func(config etc.Config) (predicate.Predicate, error) 
 		if mode == etc.AllNamespaces && strings.TrimSpace(config.ExcludeNamespaces) != "" {
 			namespaces := strings.Split(config.ExcludeNamespaces, ",")
 			for _, namespace := range namespaces {
-				matches, err := filepath.Match(strings.TrimSpace(namespace), obj.GetNamespace())
+				matched, err := filepath.Match(strings.TrimSpace(namespace), obj.GetNamespace())
 				if err != nil {
-					// In case of error we'd assume the resource should be scanned
 					return true
 				}
-				if matches {
+				if matched {
 					return false
 				}
 			}
 		}
-
 		return true
 	}), nil
 }
@@ -85,6 +84,16 @@ var InNamespace = func(namespace string) predicate.Predicate {
 var ManagedByTrivyOperator = predicate.NewPredicateFuncs(func(obj client.Object) bool {
 	if managedBy, ok := obj.GetLabels()[trivyoperator.LabelK8SAppManagedBy]; ok {
 		return managedBy == trivyoperator.AppTrivyOperator
+	}
+	return false
+})
+
+var ManagedByKubeEnforcer = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+	if managedBy, ok := obj.GetLabels()["app.kubernetes.io/managed-by"]; ok {
+		return managedBy == "KubeEnforcer"
+	}
+	if app, ok := obj.GetLabels()["app"]; ok {
+		return app == "kube-bench"
 	}
 	return false
 })
@@ -125,6 +134,25 @@ var IsLinuxNode = predicate.NewPredicateFuncs(func(obj client.Object) bool {
 	return false
 })
 
+var ExcludeNode = func(config trivyoperator.ConfigData) (predicate.Predicate, error) {
+	excludeNodes, err := config.GetNodeCollectorExcludeNodes()
+	if err != nil {
+		return nil, err
+	}
+	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		if len(excludeNodes) == 0 {
+			return false
+		}
+		var matchingLabels int
+		for key, val := range excludeNodes {
+			if lVal, ok := obj.GetLabels()[key]; ok && lVal == val {
+				matchingLabels++
+			}
+		}
+		return matchingLabels == len(excludeNodes)
+	}), nil
+}
+
 // IsLeaderElectionResource returns true for resources used in leader election, means resources
 // annotated with resourcelock.LeaderElectionRecordAnnotationKey.
 var IsLeaderElectionResource = predicate.NewPredicateFuncs(func(obj client.Object) bool {
@@ -150,3 +178,34 @@ func Not(p predicate.Predicate) predicate.Predicate {
 		},
 	}
 }
+
+var IsCoreComponents = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+	switch v := obj.(type) {
+	case *corev1.Pod:
+		if _, ok := v.GetLabels()[trivyoperator.LabelCoreComponent]; ok {
+			return true
+		} else if _, ok := v.GetLabels()[trivyoperator.LabelAddon]; ok {
+			return true
+		} else if _, ok := v.GetLabels()[trivyoperator.LabelOpenShiftAPIServer]; ok {
+			return true
+		} else if _, ok := v.GetLabels()[trivyoperator.LabelOpenShiftControllerManager]; ok {
+			return true
+		} else if _, ok := v.GetLabels()[trivyoperator.LabelOpenShiftScheduler]; ok {
+			return true
+		} else if _, ok := v.GetLabels()[trivyoperator.LabelOpenShiftEtcd]; ok {
+			return true
+		} else {
+			return false
+		}
+	case *corev1.Node:
+		return true
+	}
+	return false
+})
+
+var IsKbom = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+	if _, ok := obj.GetLabels()[trivyoperator.LabelKbom]; ok {
+		return true
+	}
+	return false
+})

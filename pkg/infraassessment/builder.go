@@ -6,16 +6,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 type ReportBuilder struct {
@@ -122,7 +123,7 @@ func (b *ReportBuilder) GetReport() (v1alpha1.InfraAssessmentReport, error) {
 	// additional RBAC permissions are not required when the OwnerReferencesPermissionsEnforcement
 	// is enabled.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement
-	report.OwnerReferences[0].BlockOwnerDeletion = pointer.Bool(false)
+	report.OwnerReferences[0].BlockOwnerDeletion = ptr.To[bool](false)
 	return report, nil
 }
 
@@ -162,7 +163,7 @@ func (b *ReportBuilder) GetClusterReport() (v1alpha1.ClusterInfraAssessmentRepor
 	// additional RBAC permissions are not required when the OwnerReferencesPermissionsEnforcement
 	// is enabled.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement
-	report.OwnerReferences[0].BlockOwnerDeletion = pointer.Bool(false)
+	report.OwnerReferences[0].BlockOwnerDeletion = ptr.To[bool](false)
 	return report, nil
 }
 

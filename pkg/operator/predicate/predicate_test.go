@@ -3,17 +3,20 @@ package predicate_test
 import (
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	predicatex "sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Predicate", func() {
@@ -284,7 +287,7 @@ var _ = Describe("Predicate", func() {
 			It("Should return false", func() {
 				obj := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{},
+						Labels: make(map[string]string),
 					},
 				}
 
@@ -378,6 +381,152 @@ var _ = Describe("Predicate", func() {
 				Expect(instance.Update(event.UpdateEvent{})).To(BeFalse())
 				Expect(instance.Delete(event.DeleteEvent{})).To(BeFalse())
 				Expect(instance.Generic(event.GenericEvent{})).To(BeFalse())
+			})
+		})
+	})
+
+	Describe("When checking a CoreComponents predicate", func() {
+		instance := predicate.IsCoreComponents
+
+		Context("Where pod is Core Component", func() {
+			It("Should return true", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "kube-system",
+						Labels:    map[string]string{"component": "api-server"},
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeTrue())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeTrue())
+			})
+		})
+
+		Context("Where Node Component", func() {
+			It("Should return false", func() {
+				obj := &corev1.Node{}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeTrue())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeTrue())
+			})
+		})
+
+		Context("Where pod is addon Component", func() {
+			It("Should return false", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "kube-system",
+						Labels:    map[string]string{"k8s-app": "kidnet"},
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeTrue())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeTrue())
+			})
+		})
+
+		Context("Where pod is addon Component", func() {
+			It("Should return false", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test-system",
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeFalse())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeFalse())
+			})
+		})
+	})
+	Describe("When checking a kbom predicate", func() {
+		instance := predicate.IsKbom
+
+		Context("Where clusterSbomReport is kbom", func() {
+			It("Should return true", func() {
+				obj := &v1alpha1.ClusterSbomReport{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{trivyoperator.LabelKbom: "kbom"},
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeTrue())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeTrue())
+			})
+		})
+
+		Context("Where Node Component", func() {
+			It("Should return false", func() {
+				obj := &v1alpha1.ClusterSbomReport{
+					ObjectMeta: metav1.ObjectMeta{},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeFalse())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeFalse())
+			})
+		})
+	})
+
+	Describe("When checking a ManagedByKubeEnforcer predicate", func() {
+		instance := predicate.ManagedByKubeEnforcer
+
+		Context("Where object is managed by kube-enforcer", func() {
+			It("Should return true", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/managed-by": "KubeEnforcer",
+						},
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeTrue())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeTrue())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeTrue())
+			})
+		})
+
+		Context("Where object is managed by foo app", func() {
+			It("Should return false", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/managed-by": "foo",
+						},
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeFalse())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeFalse())
+			})
+		})
+
+		Context("Where object is not managed by any app", func() {
+			It("Should return false", func() {
+				obj := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: make(map[string]string),
+					},
+				}
+
+				Expect(instance.Create(event.CreateEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Update(event.UpdateEvent{ObjectNew: obj})).To(BeFalse())
+				Expect(instance.Delete(event.DeleteEvent{Object: obj})).To(BeFalse())
+				Expect(instance.Generic(event.GenericEvent{Object: obj})).To(BeFalse())
 			})
 		})
 	})

@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,6 +12,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 )
 
 func TestConfigData_GetVulnerabilityReportsScanner(t *testing.T) {
@@ -53,31 +54,94 @@ func TestConfigData_GetConfigAuditReportsScanner(t *testing.T) {
 	testCases := []struct {
 		name            string
 		configData      trivyoperator.ConfigData
-		expectedError   string
 		expectedScanner trivyoperator.Scanner
 	}{
 		{
 			name: "Should return Trivy",
 			configData: trivyoperator.ConfigData{
-				"configAuditReports.scanner": "Trivy",
+				"configAuditReports.scanner": "Test",
 			},
-			expectedScanner: v1alpha1.ScannerNameTrivy,
+			expectedScanner: trivyoperator.Scanner("Test"),
 		},
 		{
-			name:          "Should return error when value is not set",
-			configData:    trivyoperator.ConfigData{},
-			expectedError: "property configAuditReports.scanner not set",
+			name:            "Scaner is not set",
+			configData:      trivyoperator.ConfigData{},
+			expectedScanner: trivyoperator.Scanner(v1alpha1.ScannerNameTrivy),
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			scanner, err := tc.configData.GetConfigAuditReportsScanner()
-			if tc.expectedError != "" {
-				require.EqualError(t, err, tc.expectedError)
+			scanner := tc.configData.GetConfigAuditReportsScanner()
+			assert.Equal(t, tc.expectedScanner, scanner)
+		})
+	}
+}
+
+func TestConfigData_GetScanJobAffinity(t *testing.T) {
+	testCases := []struct {
+		name        string
+		config      trivyoperator.ConfigData
+		expected    *corev1.Affinity
+		expectError string
+	}{
+		{
+			name:     "no scanJob.affinity in ConfigData",
+			config:   trivyoperator.ConfigData{},
+			expected: nil,
+		},
+		{
+			name:        "scanJob.affinity value is not json",
+			config:      trivyoperator.ConfigData{"scanJob.affinity": `lolwut`},
+			expected:    nil,
+			expectError: "invalid character 'l' looking for beginning of value",
+		},
+		{
+			name:     "empty JSON array",
+			config:   trivyoperator.ConfigData{"scanJob.affinity": `{}`},
+			expected: &corev1.Affinity{},
+		},
+		{
+			name: "valid affinity",
+			config: trivyoperator.ConfigData{
+				"scanJob.affinity": `{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/os","operator":"In","values":["linux"]}]},{"matchExpressions":[{"key":"virtual-kubelet.io/provider","operator":"DoesNotExist"}]}]}}}`,
+			},
+			expected: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchExpressions: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "kubernetes.io/os",
+										Operator: corev1.NodeSelectorOpIn,
+										Values:   []string{"linux"},
+									},
+								},
+							},
+							{
+								MatchExpressions: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "virtual-kubelet.io/provider",
+										Operator: corev1.NodeSelectorOpDoesNotExist,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.config.GetScanJobAffinity()
+			if tc.expectError != "" {
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
 			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.expectedScanner, scanner)
+				require.NoError(t, err, tc.name)
 			}
+			assert.Equal(t, tc.expected, got, tc.name)
 		})
 	}
 }
@@ -142,9 +206,9 @@ func TestConfigData_GetScanJobTolerations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.config.GetScanJobTolerations()
 			if tc.expectError != "" {
-				assert.Error(t, err, "unexpected end of JSON input", tc.name)
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 			}
 			assert.Equal(t, tc.expected, got, tc.name)
 		})
@@ -259,9 +323,9 @@ func TestConfigData_TestConfigData_GetNodeCollectorVolumes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.config.GetNodeCollectorVolumes()
 			if tc.expectError != "" {
-				assert.Error(t, err, "unexpected end of JSON input", tc.name)
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 			}
 			assert.Equal(t, tc.expected, got, tc.name)
 		})
@@ -308,9 +372,110 @@ func TestConfigData_TestConfigData_GetNodeCollectorVolumeMounts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.config.GetGetNodeCollectorVolumeMounts()
 			if tc.expectError != "" {
-				assert.Error(t, err, "unexpected end of JSON input", tc.name)
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
+			}
+			assert.Equal(t, tc.expected, got, tc.name)
+		})
+	}
+}
+
+func TestConfigData_GetScanJobCustomVolumes(t *testing.T) {
+	testCases := []struct {
+		name        string
+		config      trivyoperator.ConfigData
+		expected    []corev1.Volume
+		expectError string
+	}{
+		{
+			name:     "no scan Job volumes in ConfigData",
+			config:   trivyoperator.ConfigData{},
+			expected: []corev1.Volume(nil),
+		},
+		{
+			name:        "scan Job volumes value is not json",
+			config:      trivyoperator.ConfigData{"scanJob.customVolumes": `lolwut`},
+			expected:    []corev1.Volume(nil),
+			expectError: "invalid character 'l' looking for beginning of value",
+		},
+		{
+			name:     "empty JSON array",
+			config:   trivyoperator.ConfigData{"scanJob.customVolumes": `[]`},
+			expected: []corev1.Volume{},
+		},
+		{
+			name:   " JSON with valid data",
+			config: trivyoperator.ConfigData{"scanJob.customVolumes": `[{"hostPath":{"path":"/var/lib/etcd"},"name":"var-lib-etcd"}]`},
+			expected: []corev1.Volume{
+				{
+					Name: "var-lib-etcd",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/var/lib/etcd",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.config.GetScanJobCustomVolumes()
+			if tc.expectError != "" {
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
+			} else {
+				require.NoError(t, err, tc.name)
+			}
+			assert.Equal(t, tc.expected, got, tc.name)
+		})
+	}
+}
+
+func TestConfigData_GetScanJobcustomVolumeMounts(t *testing.T) {
+	testCases := []struct {
+		name        string
+		config      trivyoperator.ConfigData
+		expected    []corev1.VolumeMount
+		expectError string
+	}{
+		{
+			name:     "no scan job volume mounts in ConfigData",
+			config:   trivyoperator.ConfigData{},
+			expected: []corev1.VolumeMount(nil),
+		},
+		{
+			name:        "no scan job volume mounts value is not json",
+			config:      trivyoperator.ConfigData{"scanJob.customVolumesMount": `lolwut`},
+			expected:    []corev1.VolumeMount(nil),
+			expectError: "invalid character 'l' looking for beginning of value",
+		},
+		{
+			name:     "empty JSON array",
+			config:   trivyoperator.ConfigData{"scanJob.customVolumesMount": `[]`},
+			expected: []corev1.VolumeMount{},
+		},
+		{
+			name:   " JSON with valid data",
+			config: trivyoperator.ConfigData{"scanJob.customVolumesMount": `[{"mountPath":"/var/lib/etcd","name":"var-lib-etcd","readOnly":true}]`},
+			expected: []corev1.VolumeMount{
+				{
+					Name:      "var-lib-etcd",
+					MountPath: "/var/lib/etcd",
+					ReadOnly:  true,
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.config.GetScanJobCustomVolumeMounts()
+			if tc.expectError != "" {
+				require.Error(t, err, "unexpected end of JSON input", tc.name)
+			} else {
+				require.NoError(t, err, tc.name)
 			}
 			assert.Equal(t, tc.expected, got, tc.name)
 		})
@@ -367,14 +532,14 @@ func TestConfigData_GetScanJobAnnotations(t *testing.T) {
 		{
 			name:     "gracefully deal with unprovided annotations",
 			config:   trivyoperator.ConfigData{},
-			expected: map[string]string{},
+			expected: make(map[string]string),
 		},
 		{
 			name: "raise an error on being provided with annotations in wrong format",
 			config: trivyoperator.ConfigData{
 				"scanJob.annotations": "foo",
 			},
-			expected:    map[string]string{},
+			expected:    make(map[string]string),
 			expectError: "failed parsing incorrectly formatted custom scan job annotations: foo",
 		},
 		{
@@ -382,7 +547,7 @@ func TestConfigData_GetScanJobAnnotations(t *testing.T) {
 			config: trivyoperator.ConfigData{
 				"scanJob.annotations": "foo=bar,a=b=c",
 			},
-			expected:    map[string]string{},
+			expected:    make(map[string]string),
 			expectError: "failed parsing incorrectly formatted custom scan job annotations: foo=bar,a=b=c",
 		},
 	}
@@ -393,7 +558,7 @@ func TestConfigData_GetScanJobAnnotations(t *testing.T) {
 			if tc.expectError != "" {
 				assert.EqualError(t, err, tc.expectError, tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 				assert.Equal(t, tc.expected, scanJobAnnotations, tc.name)
 			}
 		})
@@ -420,22 +585,22 @@ func TestConfigData_GetScanJobNodeSelector(t *testing.T) {
 		{
 			name:     "gracefully deal with unprovided nodeSelector",
 			config:   trivyoperator.ConfigData{},
-			expected: map[string]string{},
+			expected: make(map[string]string),
 		},
 		{
 			name: "raise an error on being provided with empty nodeSelector",
 			config: trivyoperator.ConfigData{
 				"scanJob.nodeSelector": "{}",
 			},
-			expected: map[string]string{},
+			expected: make(map[string]string),
 		},
 		{
 			name: "raise an error on being provided with template nodeSelector in wrong format",
 			config: trivyoperator.ConfigData{
 				"scanJob.nodeSelector": "{dlzm",
 			},
-			expected:    map[string]string{},
-			expectError: "failed to parse incorrect job template nodeSelector {dlzm: invalid character 'd' looking for beginning of object key string",
+			expected:    make(map[string]string),
+			expectError: "failed to parse incorrect pod template nodeSelector {dlzm: invalid character 'd' looking for beginning of object key string",
 		},
 	}
 
@@ -445,7 +610,7 @@ func TestConfigData_GetScanJobNodeSelector(t *testing.T) {
 			if tc.expectError != "" {
 				assert.EqualError(t, err, tc.expectError, tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 				assert.Equal(t, tc.expected, scanJobPodTemplateLabels, tc.name)
 			}
 		})
@@ -459,6 +624,16 @@ func TestConfigData_GetScanJobPodTemplateLabels(t *testing.T) {
 		expected    labels.Set
 		expectError string
 	}{
+		{
+			name: "scan job template labels with additional comma at the end can be fetched successfully",
+			config: trivyoperator.ConfigData{
+				"scanJob.podTemplateLabels": "a.b=c.d/e,foo=bar,",
+			},
+			expected: labels.Set{
+				"foo": "bar",
+				"a.b": "c.d/e",
+			},
+		},
 		{
 			name: "scan job template labels can be fetched successfully",
 			config: trivyoperator.ConfigData{
@@ -498,7 +673,7 @@ func TestConfigData_GetScanJobPodTemplateLabels(t *testing.T) {
 			if tc.expectError != "" {
 				assert.EqualError(t, err, tc.expectError, tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 				assert.Equal(t, tc.expected, scanJobPodTemplateLabels, tc.name)
 			}
 		})
@@ -552,7 +727,7 @@ func TestConfigData_GetScanContainerSecurityContext(t *testing.T) {
 			if tc.expectError != "" {
 				assert.EqualError(t, err, tc.expectError, tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 				assert.Equal(t, tc.expected, scanJobSecurityContext, tc.name)
 			}
 		})
@@ -602,7 +777,7 @@ func TestConfigData_GetScanJobPodSecurityContext(t *testing.T) {
 			if tc.expectError != "" {
 				assert.EqualError(t, err, tc.expectError, tc.name)
 			} else {
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tc.name)
 				assert.Equal(t, tc.expected, scanJobPodSecurityContext, tc.name)
 			}
 		})
@@ -930,6 +1105,42 @@ func TestConfigData_ExposedSecretsScannerEnabled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			configData.Set(tc.key, tc.value)
 			got := configData.ExposedSecretsScannerEnabled()
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestConfigData_GetExcludeImages(t *testing.T) {
+	testCases := []struct {
+		name     string
+		key      string
+		value    string
+		expected []string
+	}{
+		{
+			name:     "multi pattern",
+			key:      "scanJob.excludeImages",
+			value:    "docker.io/*, ecr.io/*/*",
+			expected: []string{"docker.io/*", "ecr.io/*/*"},
+		},
+		{
+			name:     "single pattern",
+			key:      "scanJob.excludeImages",
+			value:    "docker.io/*",
+			expected: []string{"docker.io/*"},
+		},
+		{
+			name:     "no pattern",
+			key:      "scanJob.excludeImages",
+			value:    "",
+			expected: []string{},
+		},
+	}
+	for _, tc := range testCases {
+		configData := trivyoperator.ConfigData{}
+		t.Run(tc.name, func(t *testing.T) {
+			configData.Set(tc.key, tc.value)
+			got := configData.ExcludeImages()
 			assert.Equal(t, tc.expected, got)
 		})
 	}

@@ -1,9 +1,10 @@
 package metrics
 
 import (
-	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
+
+	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 )
 
 type SeverityLabel struct {
@@ -64,7 +65,7 @@ type StatusLabel struct {
 	Label  string
 }
 
-type Status string
+type Status v1alpha1.ControlStatus
 
 const (
 	FailStatus Status = "FAIL"
@@ -89,7 +90,7 @@ func NewStatusLabel(status Status) StatusLabel {
 		FailStatus: StatusFail(),
 		PassStatus: StatusPass(),
 	}
-	if sevLbl, ok := m[severity]; ok {
+	if sevLbl, ok := m[status]; ok {
 		return sevLbl
 	}
 	return StatusLabel{

@@ -1,20 +1,20 @@
 package trivy
 
 import (
-	"github.com/Masterminds/semver"
+	"github.com/aquasecurity/go-version/pkg/semver"
 )
 
-func compareTagVersion(currentTag string, contraint string) bool {
-	c, err := semver.NewConstraint(contraint)
+func compareTagVersion(currentTag, constraint string) bool {
+	c, err := semver.NewConstraints(constraint)
 	if err != nil {
 		return false
 	}
 
-	v, err := semver.NewVersion(currentTag)
+	v, err := semver.Parse(currentTag)
 	if err != nil {
 		return false
 	}
-	// Check if the version meets the constraints. The a variable will be true.
+	// Check if the version meets the constraints
 	return c.Check(v)
 }
 
@@ -24,7 +24,7 @@ func Slow(c Config) string {
 	if err != nil {
 		return ""
 	}
-	// support backward competability with older tags
+	// support backward compatibility with older tags
 	if compareTagVersion(tag, "< 0.35.0") {
 		return ""
 	}
@@ -40,7 +40,7 @@ func Scanners(c Config) string {
 	if err != nil {
 		return "--scanners"
 	}
-	// support backward competability with older tags
+	// support backward compatibility with older tags
 	if compareTagVersion(tag, "< 0.37.0") {
 		return "--security-checks"
 	}
@@ -53,11 +53,27 @@ func SkipDBUpdate(c Config) string {
 	if err != nil {
 		return "--skip-db-update"
 	}
-	// support backward competability with older tags
+	// support backward compatibility with older tags
 	if compareTagVersion(tag, "< 0.37.0") {
 		return "--skip-update"
 	}
 	return "--skip-db-update"
+}
+
+// SkipJavaDBUpdate skip update flag
+func SkipJavaDBUpdate(c Config) string {
+	if c.GetSkipJavaDBUpdate() {
+		tag, err := c.GetImageTag()
+		if err != nil {
+			return "--skip-java-db-update"
+		}
+		// support backward compatibility with older tags
+		if compareTagVersion(tag, "< 0.37.0") {
+			return ""
+		}
+		return "--skip-java-db-update"
+	}
+	return ""
 }
 
 // MultiSecretSupport validate if trivy multi secret support
@@ -66,7 +82,7 @@ func MultiSecretSupport(c Config) bool {
 	if err != nil {
 		return true
 	}
-	// support backward competability with older tags
+	// support backward compatibility with older tags
 	if compareTagVersion(tag, "< 0.38.0") {
 		return false
 	}

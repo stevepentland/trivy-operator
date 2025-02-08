@@ -5,17 +5,9 @@ import (
 	"fmt"
 	"io"
 
-	j "github.com/aquasecurity/trivy-kubernetes/pkg/jobs"
-	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
-	"github.com/aquasecurity/trivy-operator/pkg/infraassessment"
-	"github.com/aquasecurity/trivy-operator/pkg/kube"
-	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
-	. "github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
-	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	k8sapierror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -23,6 +15,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	j "github.com/aquasecurity/trivy-kubernetes/pkg/jobs"
+	"github.com/aquasecurity/trivy-operator/pkg/configauditreport"
+	"github.com/aquasecurity/trivy-operator/pkg/infraassessment"
+	"github.com/aquasecurity/trivy-operator/pkg/kube"
+	"github.com/aquasecurity/trivy-operator/pkg/operator/etc"
+	"github.com/aquasecurity/trivy-operator/pkg/policy"
+	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
+
+	. "github.com/aquasecurity/trivy-operator/pkg/operator/predicate"
 )
 
 // NodeCollectorJobController watches Kubernetes jobs generates
@@ -32,6 +34,7 @@ type NodeCollectorJobController struct {
 	etc.Config
 	kube.ObjectResolver
 	kube.LogsReader
+	PolicyLoader policy.Loader
 	trivyoperator.ConfigData
 	trivyoperator.PluginContext
 	configauditreport.PluginInMemory
@@ -70,9 +73,9 @@ func (r *NodeCollectorJobController) reconcileJobs() reconcile.Func {
 		}
 
 		switch jobCondition := job.Status.Conditions[0].Type; jobCondition {
-		case batchv1.JobComplete:
+		case batchv1.JobComplete, batchv1.JobSuccessCriteriaMet:
 			err = r.processCompleteScanJob(ctx, job)
-		case batchv1.JobFailed:
+		case batchv1.JobFailed, batchv1.JobFailureTarget:
 			err = r.processFailedScanJob(ctx, job)
 		default:
 			err = fmt.Errorf("unrecognized scan job condition: %v", jobCondition)
@@ -94,7 +97,7 @@ func (r *NodeCollectorJobController) processCompleteScanJob(ctx context.Context,
 	node := &corev1.Node{}
 	err = r.Client.Get(ctx, client.ObjectKey{Name: nodeRef.Name}, node)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8sapierror.IsNotFound(err) {
 			log.V(1).Info("Ignore processing node info collector job for node that must have been deleted")
 			log.V(1).Info("Deleting complete node info collector job")
 			return r.deleteJob(ctx, job)
@@ -115,7 +118,7 @@ func (r *NodeCollectorJobController) processCompleteScanJob(ctx context.Context,
 
 	logsStream, err := r.LogsReader.GetLogsByJobAndContainerName(ctx, job, j.NodeCollectorName)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8sapierror.IsNotFound(err) {
 			log.V(1).Info("Cached job must have been deleted")
 			return nil
 		}
@@ -133,7 +136,7 @@ func (r *NodeCollectorJobController) processCompleteScanJob(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger)
+	policies, err := Policies(ctx, r.Config, r.Client, cac, r.Logger, r.PolicyLoader)
 	if err != nil {
 		return fmt.Errorf("getting policies: %w", err)
 	}

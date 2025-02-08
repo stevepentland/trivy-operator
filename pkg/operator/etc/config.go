@@ -3,6 +3,7 @@ package etc
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ type Config struct {
 	LogDevMode                                   bool           `env:"OPERATOR_LOG_DEV_MODE" envDefault:"false"`
 	ScanJobTimeout                               time.Duration  `env:"OPERATOR_SCAN_JOB_TIMEOUT" envDefault:"5m"`
 	ScanJobTTL                                   *time.Duration `env:"OPERATOR_SCAN_JOB_TTL"`
+	ScanSecretTTL                                *time.Duration `env:"OPERATOR_SCAN_SECRET_TTL"`
 	ConcurrentScanJobsLimit                      int            `env:"OPERATOR_CONCURRENT_SCAN_JOBS_LIMIT" envDefault:"10"`
 	ConcurrentNodeCollectorLimit                 int            `env:"OPERATOR_CONCURRENT_NODE_COLLECTOR_LIMIT" envDefault:"1"`
 	ScanJobRetryAfter                            time.Duration  `env:"OPERATOR_SCAN_JOB_RETRY_AFTER" envDefault:"30s"`
@@ -27,10 +29,18 @@ type Config struct {
 	MetricsFindingsEnabled                       bool           `env:"OPERATOR_METRICS_FINDINGS_ENABLED" envDefault:"true"`
 	MetricsVulnerabilityId                       bool           `env:"OPERATOR_METRICS_VULN_ID_ENABLED" envDefault:"false"`
 	MetricsExposedSecretInfo                     bool           `env:"OPERATOR_METRICS_EXPOSED_SECRET_INFO_ENABLED" envDefault:"false"`
+	MetricsConfigAuditInfo                       bool           `env:"OPERATOR_METRICS_CONFIG_AUDIT_INFO_ENABLED" envDefault:"false"`
+	MetricsRbacAssessmentInfo                    bool           `env:"OPERATOR_METRICS_RBAC_ASSESSMENT_INFO_ENABLED" envDefault:"false"`
+	MetricsInfraAssessmentInfo                   bool           `env:"OPERATOR_METRICS_INFRA_ASSESSMENT_INFO_ENABLED" envDefault:"false"`
+	MetricsImageInfo                             bool           `env:"OPERATOR_METRICS_IMAGE_INFO_ENABLED" envDefault:"false"`
+	MetricsClusterComplianceInfo                 bool           `env:"OPERATOR_METRICS_CLUSTER_COMPLIANCE_INFO_ENABLED" envDefault:"false"`
 	HealthProbeBindAddress                       string         `env:"OPERATOR_HEALTH_PROBE_BIND_ADDRESS" envDefault:":9090"`
 	VulnerabilityScannerEnabled                  bool           `env:"OPERATOR_VULNERABILITY_SCANNER_ENABLED" envDefault:"true"`
+	SbomGenerationEnable                         bool           `env:"OPERATOR_SBOM_GENERATION_ENABLED" envDefault:"true"`
+	ClusterSbomCacheEnable                       bool           `env:"OPERATOR_CLUSTER_SBOM_CACHE_ENABLED" envDefault:"true"`
 	VulnerabilityScannerScanOnlyCurrentRevisions bool           `env:"OPERATOR_VULNERABILITY_SCANNER_SCAN_ONLY_CURRENT_REVISIONS" envDefault:"true"`
 	ScannerReportTTL                             *time.Duration `env:"OPERATOR_SCANNER_REPORT_TTL" envDefault:"24h"`
+	CacheReportTTL                               *time.Duration `env:"OPERATOR_CACHE_REPORT_TTL" envDefault:"120h"`
 	ClusterComplianceEnabled                     bool           `env:"OPERATOR_CLUSTER_COMPLIANCE_ENABLED" envDefault:"true"`
 	InvokeClusterComplianceOnce                  bool           `env:"OPERATOR_INVOKE_CLUSTER_COMPLIANCE_ONCE" envDefault:"false"` // for testing purposes only
 	ConfigAuditScannerEnabled                    bool           `env:"OPERATOR_CONFIG_AUDIT_SCANNER_ENABLED" envDefault:"true"`
@@ -42,6 +52,7 @@ type Config struct {
 	ExposedSecretScannerEnabled                  bool           `env:"OPERATOR_EXPOSED_SECRET_SCANNER_ENABLED" envDefault:"true"`
 	WebhookBroadcastURL                          string         `env:"OPERATOR_WEBHOOK_BROADCAST_URL"`
 	WebhookBroadcastTimeout                      *time.Duration `env:"OPERATOR_WEBHOOK_BROADCAST_TIMEOUT" envDefault:"30s"`
+	WebhookBroadcastCustomHeaders                string         `env:"OPERATOR_WEBHOOK_BROADCAST_CUSTOM_HEADERS"`
 	WebhookSendDeletedReports                    bool           `env:"OPERATOR_SEND_DELETED_REPORTS" envDefault:"false"`
 	TargetWorkloads                              string         `env:"OPERATOR_TARGET_WORKLOADS" envDefault:"Pod,ReplicaSet,ReplicationController,StatefulSet,DaemonSet,CronJob,Job"`
 	AccessGlobalSecretsAndServiceAccount         bool           `env:"OPERATOR_ACCESS_GLOBAL_SECRETS_SERVICE_ACCOUNTS" envDefault:"true"`
@@ -49,6 +60,7 @@ type Config struct {
 	BuiltInTrivyServer                           bool           `env:"OPERATOR_BUILT_IN_TRIVY_SERVER" envDefault:"false"`
 	TrivyServerHealthCheckCacheExpiration        *time.Duration `env:"TRIVY_SERVER_HEALTH_CHECK_CACHE_EXPIRATION" envDefault:"10h"`
 	MergeRbacFindingWithConfigAudit              bool           `env:"OPERATOR_MERGE_RBAC_FINDING_WITH_CONFIG_AUDIT" envDefault:"false"`
+	ControllerCacheSyncTimeout                   *time.Duration `env:"CONTROLLER_CACHE_SYNC_TIMEOUT" envDefault:"5m"`
 }
 
 // GetOperatorConfig loads Config from environment variables.
@@ -83,7 +95,7 @@ func (c Config) GetTargetNamespaces() []string {
 
 func (c Config) GetPrivateRegistryScanSecretsNames() (map[string]string, error) {
 	privateRegistryScanSecretsNames := c.PrivateRegistryScanSecretsNames
-	secretsInfoMap := map[string]string{}
+	secretsInfoMap := make(map[string]string)
 	if privateRegistryScanSecretsNames != "" {
 		err := json.Unmarshal([]byte(privateRegistryScanSecretsNames), &secretsInfoMap)
 		if err != nil {
@@ -91,6 +103,23 @@ func (c Config) GetPrivateRegistryScanSecretsNames() (map[string]string, error) 
 		}
 	}
 	return secretsInfoMap, nil
+}
+
+func (c Config) GetWebhookBroadcastCustomHeaders() http.Header {
+	customHeaders := c.WebhookBroadcastCustomHeaders
+	headers := http.Header{}
+
+	if customHeaders != "" {
+		for _, header := range strings.Split(customHeaders, ",") {
+			s := strings.SplitN(header, ":", 2)
+			if len(s) != 2 {
+				continue
+			}
+			headers.Set(s[0], s[1])
+		}
+	}
+
+	return headers
 }
 
 func (c Config) GetTargetWorkloads() []string {
